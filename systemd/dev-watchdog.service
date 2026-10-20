@@ -1,0 +1,7 @@
+[Unit]
+Description=Dev sandbox disk-space watchdog
+
+[Service]
+Type=oneshot
+Environment=DEV_SANDBOX=@SANDBOX@
+ExecStart=@SANDBOX@/bin/dev watchdog

@@ -1,0 +1,15 @@
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "builder": {
+    "gc": {
+      "enabled": true,
+      "defaultKeepStorage": "10GB"
+    }
+  },
+  "cgroup-parent": "dockerdev.slice",
+  "live-restore": true
+}

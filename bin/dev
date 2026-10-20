@@ -1,0 +1,977 @@
+#!/usr/bin/env bash
+# dev - development sandbox manager.
+#
+# Active projects live in ~/sandbox/projects and keep their dependencies and
+# build outputs. Inactive projects live anywhere else and keep only source code.
+# Shared package caches (npm, pnpm, uv, Go, Gradle) live in ~/sandbox/cache and
+# are pruned whenever a project is deactivated.
+
+set -euo pipefail
+
+VERSION="1.2.0"
+SANDBOX="${DEV_SANDBOX:-$HOME/sandbox}"
+PROJECTS="$SANDBOX/projects"
+STATE="$SANDBOX/state/projects.tsv"
+CACHE="$SANDBOX/cache"
+# Where `dev doctor` looks for inactive projects that still hold artifacts.
+read -r -a PROJECT_ROOTS <<< "${DEV_PROJECT_ROOTS:-$HOME/projects $HOME/Desktop/projects}"
+# A directory containing this file is never moved or cleaned by dev.
+KEEP_MARKER=".devkeep"
+# Emergency reserve: an allocated file to delete when the disk is critically full.
+BALLAST="$HOME/.local/share/dev-ballast" BALLAST_GB=2
+# Soft disk limits in whole GB; override them in $SANDBOX/limits.conf.
+LIMIT_SANDBOX_GB=40 LIMIT_PROJECT_GB=10 MIN_FREE_GB=10 WARN_FREE_GB=15 CRITICAL_FREE_GB=5
+FS_WARN_FREE_GB=5 FS_CRITICAL_FREE_GB=2
+# Resource limits applied by `dev limits apply`; also set in limits.conf.
+SANDBOX_IMAGE_GB=50 TERM_SLICE=app-org.gnome.Terminal.slice
+TERM_MEMORY_HIGH=65% TERM_MEMORY_MAX=80% TERM_SWAP_MAX=4G TERM_TASKS_MAX=20000 TERM_CPU_WEIGHT=50 TERM_CPU_CORES=4
+DOCKER_MEMORY_HIGH=35% DOCKER_MEMORY_MAX=45% DOCKER_SWAP_MAX=2G DOCKER_TASKS_MAX=16384 DOCKER_CPU_WEIGHT=50 DOCKER_CPU_CORES=4
+BUILD_MEMORY=4G BUILD_MEMORY_SWAP=6G BUILD_CPU_CORES=2 BUILD_CACHE_GB=10
+USER_MEMORY_HIGH=85% USER_MEMORY_MAX=90%
+LIMITS="$SANDBOX/limits.conf"
+IMAGE="${DEV_SANDBOX_IMAGE:-$HOME/.local/share/dev-sandbox/sandbox.img}"
+# shellcheck source=/dev/null
+[[ -f $LIMITS ]] && . "$LIMITS"
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' N=$'\e[0m'
+else
+  B="" D="" R="" G="" Y="" N=""
+fi
+
+info() { printf '%s->%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+human() { numfmt --to=iec --suffix=B "${1:-0}"; }
+# Free space of the sandbox filesystem, and of the disk it lives on ($HOME is
+# never on the sandbox filesystem, which may be a size-capped image).
+avail_bytes() { df --output=avail -B1 "$SANDBOX" | tail -1 | tr -d ' '; }
+host_avail_bytes() { df --output=avail -B1 "$HOME" | tail -1 | tr -d ' '; }
+size_of() { du -sb "$@" 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
+gb() { printf '%s\n' $(( $1 * 1024 * 1024 * 1024 )); }
+
+confirm() {
+  local answer
+  [[ -r /dev/tty ]] || die "cannot ask for confirmation without a terminal (use --yes)"
+  read -r -p "$1 [y/N] " answer < /dev/tty
+  [[ $answer == [yY] || $answer == [yY][eE][sS] ]]
+}
+
+usage() {
+  cat <<EOF
+${B}dev${N} $VERSION - development sandbox manager
+
+Active projects live in $PROJECTS and keep their dependencies.
+Inactive projects keep only source code; their dependencies, build outputs and
+unused shared caches are removed when you deactivate them.
+
+${B}Usage:${N} dev <command> [options]
+
+${B}Commands:${N}
+  activate <path> [--name NAME] [--no-install] [--force]
+        Move a project into the sandbox and install its dependencies.
+        npm/yarn projects are migrated to pnpm.
+  deactivate <name> [--force]
+        Delete the project's dependencies and build outputs, move it back to
+        where it came from, and prune shared caches.
+  status
+        Show active projects, shared cache sizes and global tools.
+  list
+        List active projects with their sandbox and original paths.
+  path <name>
+        Print the sandbox path of an active project:  cd "\$(dev path NAME)"
+  clean <path> [--dry-run] [--yes]
+        Delete dependencies and build outputs under an inactive directory.
+  prune
+        Prune shared caches, keeping only what active projects may need.
+  doctor
+        Check configuration and find leftovers (stray venvs, legacy caches,
+        inactive projects that still hold artifacts) and limits near 80%.
+  watchdog
+        Notify when free disk space drops below the warning/critical level.
+        Run every few minutes by the dev-watchdog.timer user timer.
+  limits [show | set KEY=VALUE ... | edit | apply]
+        Show or change every limit in limits.conf: disk, RAM, swap and CPU for
+        terminals, Docker containers and Docker builds. 'apply' puts them into
+        effect and prints the one sudo command root-level changes need.
+
+${B}Limits:${N} $LIMITS holds all limits. Disk: sandbox ${LIMIT_SANDBOX_GB}GB, project
+  ${LIMIT_PROJECT_GB}GB, ${MIN_FREE_GB}GB free ('activate' refuses past them). See 'dev limits'.
+
+${B}Options:${N}
+  -h, --help       Show this help
+  -V, --version    Show version
+
+${B}What gets deleted:${N}
+  node_modules .next .nuxt .svelte-kit .turbo .parcel-cache .vite .angular
+  .expo __pycache__ .pytest_cache .mypy_cache .ruff_cache .pixi, Python venvs
+  (.venv/venv with pyvenv.cfg), and build dist target coverage .gradle .cxx
+  .dart_tool Pods only next to a matching build file (package.json,
+  build.gradle, Cargo.toml, ...). Directories tracked by git are never deleted.
+  Source code, .git and .env files are never touched.
+
+${B}Protecting a directory:${N}
+  touch <dir>/$KEEP_MARKER    dev will never move or clean it.
+EOF
+}
+
+# ---------------------------------------------------------------- state ----
+
+state_origin() { awk -F'\t' -v n="$1" '$1 == n {print $2; exit}' "$STATE"; }
+state_names()  { awk -F'\t' 'NF {print $1}' "$STATE"; }
+state_add()    { printf '%s\t%s\t%s\n' "$1" "$2" "$(date -Iseconds)" >> "$STATE"; }
+state_remove() {
+  local tmp
+  tmp=$(mktemp "$STATE.XXXXXX")
+  awk -F'\t' -v n="$1" '$1 != n' "$STATE" > "$tmp"
+  mv "$tmp" "$STATE"
+}
+
+ensure_layout() {
+  mkdir -p "$PROJECTS" "$CACHE" "$(dirname "$STATE")"
+  touch "$STATE"
+}
+
+# Accepts a project name or a path inside the sandbox.
+resolve_name() {
+  local arg=${1%/} rel
+  if [[ $arg == */* ]]; then
+    arg=$(realpath -m "$arg")
+    rel=${arg#"$PROJECTS"/}
+    [[ $rel != "$arg" ]] || die "'$1' is not inside $PROJECTS"
+    arg=${rel%%/*}
+  fi
+  [[ -n $(state_origin "$arg") ]] || die "'$arg' is not an active project (see 'dev list')"
+  printf '%s\n' "$arg"
+}
+
+# ------------------------------------------------------------ artifacts ----
+
+ARTIFACT_NAMES=(node_modules .next .nuxt .svelte-kit .turbo .parcel-cache .vite
+  .angular .expo __pycache__ .pytest_cache .mypy_cache .ruff_cache .pixi .venv
+  venv .gradle .cxx .dart_tool Pods build dist target coverage)
+GRADLE_FILES=(build.gradle build.gradle.kts settings.gradle settings.gradle.kts)
+
+has_any() {
+  local dir=$1 f
+  shift
+  for f; do [[ -e $dir/$f ]] && return 0; done
+  return 1
+}
+
+git_tracked() {
+  local out
+  out=$(git -C "$(dirname "$1")" ls-files -- "$(basename "$1")" 2>/dev/null) || return 1
+  [[ -n $out ]]
+}
+
+is_artifact() {
+  local dir=$1 parent name
+  parent=$(dirname "$dir")
+  name=$(basename "$dir")
+  case $name in
+    node_modules|.next|.nuxt|.svelte-kit|.turbo|.parcel-cache|.vite|.angular|.expo|\
+    __pycache__|.pytest_cache|.mypy_cache|.ruff_cache|.pixi) ;;
+    .venv|venv) [[ -f $dir/pyvenv.cfg ]] || return 1 ;;
+    .gradle|.cxx) has_any "$parent" "${GRADLE_FILES[@]}" || return 1 ;;
+    .dart_tool)   has_any "$parent" pubspec.yaml || return 1 ;;
+    Pods)         has_any "$parent" Podfile || return 1 ;;
+    build) has_any "$parent" "${GRADLE_FILES[@]}" package.json pyproject.toml \
+             setup.py pubspec.yaml CMakeLists.txt || return 1 ;;
+    dist)     has_any "$parent" package.json pyproject.toml setup.py || return 1 ;;
+    target)   has_any "$parent" Cargo.toml pom.xml || return 1 ;;
+    coverage) has_any "$parent" package.json || return 1 ;;
+    *) return 1 ;;
+  esac
+  ! git_tracked "$dir"
+}
+
+# Prints deletable directories under $1, one per line. Skips .git, the sandbox
+# (unless $1 is inside it) and directories protected by $KEEP_MARKER.
+find_artifacts() {
+  local root=$1 expr=() name dir skip=()
+  for name in "${ARTIFACT_NAMES[@]}"; do expr+=(-o -name "$name"); done
+  [[ $root == "$SANDBOX" || $root == "$SANDBOX"/* ]] || skip=(-path "$SANDBOX" -prune -o)
+  keep_prunes "$root" skip
+  find "$root" "${skip[@]}" -name .git -prune -o \
+    -type d \( "${expr[@]:1}" \) -prune -print 2>/dev/null |
+  while IFS= read -r dir; do
+    if is_artifact "$dir"; then printf '%s\n' "$dir"; fi
+  done
+}
+
+# Appends find(1) arguments to array $2 that prune every directory under $1
+# protected by $KEEP_MARKER.
+keep_prunes() {
+  local -n _prunes=$2
+  local marker
+  while IFS= read -r marker; do
+    _prunes+=(-path "$(dirname "$marker")" -prune -o)
+  done < <(find "$1" \( -name node_modules -o -name .git \) -prune -o \
+             -name "$KEEP_MARKER" -type f -print 2>/dev/null)
+}
+
+remove_dir() {
+  rm -rf -- "$1" 2>/dev/null || { chmod -R u+w -- "$1" 2>/dev/null; rm -rf -- "$1"; }
+}
+
+# Prints the ecosystems used by a project tree: node python go gradle.
+project_kinds() {
+  find "$1" \( -name node_modules -o -name .git -o -name .venv -o -name build \
+      -o -name .gradle \) -prune -o -type f \( -name package.json \
+      -o -name pyproject.toml -o -name requirements.txt -o -name go.mod \
+      -o -name 'build.gradle*' -o -name 'settings.gradle*' \) -print 2>/dev/null |
+    sed -E 's#.*/##; s#^package\.json$#node#; s#^(pyproject\.toml|requirements\.txt)$#python#;
+            s#^go\.mod$#go#; s#^(build|settings)\.gradle(\.kts)?$#gradle#' | sort -u
+}
+
+active_kinds() {
+  local name
+  for name in $(state_names); do project_kinds "$PROJECTS/$name"; done | sort -u
+}
+
+# Lists "pid command" for processes whose working directory is inside $1.
+procs_in() {
+  local proc cwd
+  for proc in /proc/[0-9]*; do
+    [[ ${proc#/proc/} == "$$" ]] && continue
+    cwd=$(readlink "$proc/cwd" 2>/dev/null) || continue
+    if [[ $cwd == "$1" || $cwd == "$1"/* ]]; then
+      printf '  %s %s\n' "${proc#/proc/}" "$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null | cut -c1-80)"
+    fi
+  done
+}
+
+check_no_procs() {
+  local dir=$1 force=$2 procs
+  if [[ $PWD == "$dir" || $PWD == "$dir"/* ]]; then
+    die "your shell is inside $dir; cd out of it first"
+  fi
+  procs=$(procs_in "$dir")
+  if [[ -n $procs ]]; then
+    printf '%s\n' "Processes running inside $dir:" "$procs" >&2
+    [[ $force == 1 ]] || die "stop them first (dev servers, editors, terminals) or use --force"
+    warn "continuing because of --force"
+  fi
+}
+
+# ---------------------------------------------------------------- limits ----
+
+# Refuses to continue when the disk is nearly full or the sandbox is over its limit.
+check_room() {
+  local free used
+  free=$(host_avail_bytes)
+  ((free >= $(gb "$MIN_FREE_GB"))) ||
+    die "only $(human "$free") of disk space is free (minimum ${MIN_FREE_GB}GB); free some first (dev prune, docker system prune)"
+  used=$(size_of "$PROJECTS" "$CACHE")
+  ((used < $(gb "$LIMIT_SANDBOX_GB"))) ||
+    die "the sandbox uses $(human "$used"), over its ${LIMIT_SANDBOX_GB}GB limit (limits.conf); deactivate a project or run 'dev prune'"
+}
+
+# Warns after an install when the project or the sandbox ended up over its limit.
+warn_over_limits() {
+  local project sandbox
+  project=$(size_of "$PROJECTS/$1")
+  sandbox=$(size_of "$PROJECTS" "$CACHE")
+  ((project <= $(gb "$LIMIT_PROJECT_GB"))) ||
+    warn "$1 uses $(human "$project"), over the ${LIMIT_PROJECT_GB}GB project limit"
+  ((sandbox <= $(gb "$LIMIT_SANDBOX_GB"))) ||
+    warn "the sandbox uses $(human "$sandbox"), over its ${LIMIT_SANDBOX_GB}GB limit"
+}
+
+# Prints "label  used / limit  pct%": yellow from 80%, red from 100%.
+limit_line() {
+  local pct=$(($2 * 100 / $3)) color=$G
+  if ((pct >= 100)); then color=$R; elif ((pct >= 80)); then color=$Y; fi
+  printf '  %-28s %8s / %-8s %s%3d%%%s\n' "$1" "$(human "$2")" "$(human "$3")" "$color" "$pct" "$N"
+}
+
+# ------------------------------------------------------- resource limits ----
+
+# Checks one limits.conf value by the naming convention of its key.
+valid_limit() {
+  local key=$1 value=$2
+  case $key in
+    TERM_SLICE) [[ $value =~ ^[A-Za-z0-9@._-]+\.slice$ ]] ;;
+    *_FREE_GB) [[ $value =~ ^[0-9]+$ ]] ;;
+    *_GB|*_CORES|*_WEIGHT|*_TASKS_MAX) [[ $value =~ ^[1-9][0-9]*$ ]] ;;
+    BUILD_*) [[ $value =~ ^[1-9][0-9]*[KMGT]$ ]] ;;
+    *_SWAP_MAX) [[ $value =~ ^[0-9]+[KMGT]?$ ]] ;;
+    *_MEMORY_*) [[ $value =~ ^[0-9]+[KMGT]?$ || $value =~ ^[1-9][0-9]?%$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_limits() {
+  local key value cores
+  while IFS='=' read -r key value; do
+    valid_limit "$key" "$value" || die "invalid value in $LIMITS: $key=$value"
+  done < <(grep -E '^[A-Z_]+=' "$LIMITS")
+  cores=$(nproc)
+  for key in TERM_CPU_CORES DOCKER_CPU_CORES BUILD_CPU_CORES; do
+    ((${!key} <= cores)) || die "$key=${!key} is more than the $cores cores of this machine"
+  done
+  ((CRITICAL_FREE_GB < WARN_FREE_GB)) || die "CRITICAL_FREE_GB must be below WARN_FREE_GB"
+}
+
+# Prints the systemd [Slice] settings for prefix $1 (TERM or DOCKER).
+slice_settings() {
+  local p=$1 high max swap tasks weight cores
+  high=${p}_MEMORY_HIGH max=${p}_MEMORY_MAX swap=${p}_SWAP_MAX
+  tasks=${p}_TASKS_MAX weight=${p}_CPU_WEIGHT cores=${p}_CPU_CORES
+  printf '%s\n' "[Slice]" \
+    "# Soft limit: above this the kernel throttles and reclaims instead of killing." \
+    "MemoryHigh=${!high}" \
+    "# Hard limit: the OOM killer acts inside this slice, not on the desktop." \
+    "MemoryMax=${!max}" "MemorySwapMax=${!swap}" \
+    "# Fork-bomb guard." "TasksMax=${!tasks}" \
+    "# Yields to the desktop when both compete (the default weight is 100)." \
+    "CPUWeight=${!weight}" "CPUQuota=$((${!cores} * 100))%"
+}
+
+# Prints "configured  live" for one systemd property, marking a difference.
+live_row() {
+  local label=$1 want=$2 live=$3 shown=$3 mark=""
+  case $live in
+    "" ) shown="-" ;;
+    infinity) ;;
+    # CPUQuotaPerSecUSec: "14s" of CPU time per second is 14 cores.
+    *s) live=${live%s} shown=${live%s}; [[ $shown =~ ^[0-9]+$ ]] && shown="$shown cores" ;;
+    *) [[ $live =~ ^[0-9]+$ && $live -ge 1048576 ]] && shown=$(numfmt --to=iec "$live") ;;
+  esac
+  if [[ $want =~ ^[0-9]+[KMGT]$ && $live =~ ^[0-9]+$ ]]; then
+    [[ $(numfmt --from=iec "$want") == "$live" ]] || mark="$Y  (not applied)$N"
+  elif [[ $want =~ ^[0-9]+$ && $live =~ ^[0-9]+$ ]]; then
+    [[ $want == "$live" ]] || mark="$Y  (not applied)$N"
+  fi
+  printf '  %-16s %-10s %s%s\n' "$label" "$want" "$shown" "$mark"
+}
+
+# Fills associative array $3 with the systemd properties of unit $2
+# ($1: --user or --system). systemctl prints them in its own order.
+unit_props() {
+  local -n _props=$3
+  local key value
+  while IFS='=' read -r key value; do _props[$key]=$value; done < <(
+    systemctl "$1" show "$2" -p MemoryHigh -p MemoryMax -p MemorySwapMax -p TasksMax \
+      -p CPUWeight -p CPUQuotaPerSecUSec 2>/dev/null)
+}
+
+show_slice() {
+  local p=$3 high max swap tasks weight cores
+  local -A live=()
+  unit_props "$1" "$2" live
+  high=${p}_MEMORY_HIGH max=${p}_MEMORY_MAX swap=${p}_SWAP_MAX
+  tasks=${p}_TASKS_MAX weight=${p}_CPU_WEIGHT cores=${p}_CPU_CORES
+  live_row MemoryHigh "${!high}" "${live[MemoryHigh]:-}"
+  live_row MemoryMax "${!max}" "${live[MemoryMax]:-}"
+  live_row MemorySwapMax "${!swap}" "${live[MemorySwapMax]:-}"
+  live_row TasksMax "${!tasks}" "${live[TasksMax]:-}"
+  live_row CPUWeight "${!weight}" "${live[CPUWeight]:-}"
+  live_row CPUQuota "${!cores}" "${live[CPUQuotaPerSecUSec]:-}"
+}
+
+limits_show() {
+  local live builder cache
+  printf '%sLIMITS%s  %s%s%s\n' "$B" "$N" "$D" "${LIMITS/#"$HOME"/\~}" "$N"
+  printf '  %s%-16s %-10s %s%s\n' "$D" "" "configured" "live" "$N"
+
+  printf '\n%sTERMINAL SESSIONS%s  %s%s (dev limits apply)%s\n' "$B" "$N" "$D" "$TERM_SLICE" "$N"
+  show_slice --user "$TERM_SLICE" TERM
+
+  printf '\n%sDOCKER CONTAINERS%s  %sdockerdev.slice (sudo)%s\n' "$B" "$N" "$D" "$N"
+  show_slice --system dockerdev.slice DOCKER
+
+  printf '\n%sDOCKER BUILDS%s  %sbuildx builder "capped" (dev limits apply)%s\n' "$B" "$N" "$D" "$N"
+  builder=$(docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.CpuQuota}}' \
+    buildx_buildkit_capped0 2>/dev/null) || builder=""
+  read -r -a live <<< "$builder"
+  cache=$(sed -nE 's/^ *maxUsedSpace *= *"([0-9]+)GB".*/\1/p' "$SANDBOX/system/docker/buildkitd.toml" 2>/dev/null)
+  live_row memory "$BUILD_MEMORY" "${live[0]:-}"
+  live_row memory+swap "$BUILD_MEMORY_SWAP" "${live[1]:-}"
+  live_row cpus "$BUILD_CPU_CORES" "$(( ${live[2]:-0} / 100000 ))"
+  live_row "cache (GB)" "$BUILD_CACHE_GB" "${cache:-}"
+
+  printf '\n%sWHOLE USER SESSION%s  %suser-%s.slice (sudo)%s\n' "$B" "$N" "$D" "$UID" "$N"
+  local -A user=()
+  unit_props --system "user-$UID.slice" user
+  live_row MemoryHigh "$USER_MEMORY_HIGH" "${user[MemoryHigh]:-}"
+  live_row MemoryMax "$USER_MEMORY_MAX" "${user[MemoryMax]:-}"
+
+  printf '\n%sDISK%s  %ssoft limits enforced by dev; image size needs sudo%s\n' "$B" "$N" "$D" "$N"
+  local key
+  for key in LIMIT_SANDBOX_GB LIMIT_PROJECT_GB MIN_FREE_GB WARN_FREE_GB CRITICAL_FREE_GB \
+             FS_WARN_FREE_GB FS_CRITICAL_FREE_GB; do
+    printf '  %-20s %s\n' "$key" "${!key}"
+  done
+  if [[ -f $IMAGE ]]; then
+    live_row "image (GB)" "$SANDBOX_IMAGE_GB" "$(( $(stat -c %s "$IMAGE") / 1024 / 1024 / 1024 ))"
+  fi
+  printf '\n%sChange with: dev limits set KEY=VALUE ... && dev limits apply%s\n' "$D" "$N"
+}
+
+limits_set() {
+  local arg key value tmp
+  (($#)) || die "usage: dev limits set KEY=VALUE ..."
+  for arg; do
+    [[ $arg == *=* ]] || die "expected KEY=VALUE, got '$arg'"
+    key=${arg%%=*} value=${arg#*=}
+    grep -qE "^$key=" "$LIMITS" 2>/dev/null || die "unknown limit '$key' (see $LIMITS)"
+    valid_limit "$key" "$value" || die "invalid value for $key: '$value'"
+  done
+  tmp=$(mktemp "$LIMITS.XXXXXX")
+  cp "$LIMITS" "$tmp"
+  for arg; do
+    key=${arg%%=*} value=${arg#*=}
+    awk -v k="$key" -v v="$value" 'index($0, k "=") == 1 { $0 = k "=" v } { print }' "$tmp" > "$tmp.new"
+    mv "$tmp.new" "$tmp"
+  done
+  # Check the result as a whole before it replaces limits.conf.
+  # shellcheck source=/dev/null
+  if ! (LIMITS=$tmp; . "$tmp"; validate_limits); then rm -f "$tmp"; exit 1; fi
+  mv "$tmp" "$LIMITS"
+  # shellcheck source=/dev/null
+  . "$LIMITS"
+  for arg; do info "$arg"; done
+  printf '%sRun %sdev limits apply%s%s to put it into effect.%s\n' "$D" "$B" "$N" "$D" "$N"
+}
+
+apply_terminal() {
+  local dir="$HOME/.config/systemd/user/$TERM_SLICE.d" props
+  mkdir -p "$dir"
+  {
+    printf '%s\n' "# Generated by 'dev limits apply' from $LIMITS; edit that file instead." \
+      "# Resource limits for everything started from these terminal windows."
+    slice_settings TERM
+  } > "$dir/10-dev-limits.conf"
+  systemctl --user daemon-reload
+  # Also set the values on the running slice, so open terminals get them now.
+  props=$(slice_settings TERM | grep -v '^[[#]')
+  # shellcheck disable=SC2086
+  systemctl --user set-property --runtime "$TERM_SLICE" $props 2>/dev/null || true
+  info "terminal sessions: $TERM_SLICE updated"
+}
+
+apply_builder() {
+  local stamp="$SANDBOX/state/builder.applied" want
+  want="$BUILD_MEMORY $BUILD_MEMORY_SWAP $BUILD_CPU_CORES $BUILD_CACHE_GB"
+  if ! have docker || ! docker buildx inspect capped >/dev/null 2>&1; then
+    info "docker builds: no capped builder (set one up with $SANDBOX/system/docker/setup-builder.sh)"
+    return
+  fi
+  if [[ -f $stamp && $(<"$stamp") == "$want" ]]; then
+    info "docker builds: unchanged"
+    return
+  fi
+  info "docker builds: recreating the capped builder (its build cache is dropped)"
+  bash "$SANDBOX/system/docker/setup-builder.sh" >/dev/null
+  printf '%s\n' "$want" > "$stamp"
+}
+
+# Root-level limits cannot be applied without sudo; prints the command instead.
+apply_root() {
+  local slice="$SANDBOX/system/docker/dockerdev.slice" pending=() stamp
+  {
+    printf '%s\n' "# Generated by 'dev limits apply' from DOCKER_* in $LIMITS." \
+      "# Installed by: sudo bash $SANDBOX/system/apply-root.sh" \
+      "# The name has no dash on purpose: \"a-b.slice\" would nest under \"a.slice\"." \
+      "[Unit]" "Description=Resource cap for Docker containers and builds (dev sandbox)" \
+      "Before=slices.target" ""
+    slice_settings DOCKER
+  } > "$slice"
+  cmp -s "$slice" /etc/systemd/system/dockerdev.slice || pending+=("Docker slice")
+  stamp=$(cat "$SANDBOX/state/user-slice.applied" 2>/dev/null) || true
+  [[ $stamp == "$USER_MEMORY_HIGH $USER_MEMORY_MAX" ]] || pending+=("user slice")
+  if [[ -f $IMAGE ]]; then
+    local size want
+    size=$(stat -c %s "$IMAGE") want=$(gb "$SANDBOX_IMAGE_GB")
+    if ((want > size)); then pending+=("sandbox image ${SANDBOX_IMAGE_GB}GB")
+    elif ((want < size)); then
+      warn "SANDBOX_IMAGE_GB=$SANDBOX_IMAGE_GB is smaller than the image ($(human "$size")); shrinking is not supported"
+    fi
+  fi
+  if ((${#pending[@]})); then
+    printf '%s->%s needs root (%s); run it yourself:\n   sudo bash %s\n' "$Y" "$N" \
+      "$(IFS=,; printf '%s' "${pending[*]}" | sed 's/,/, /g')" "${SANDBOX/#"$HOME"/\~}/system/apply-root.sh"
+  else
+    info "root-level limits: unchanged"
+  fi
+}
+
+cmd_limits() {
+  local sub=${1:-show}
+  (($#)) && shift
+  [[ -f $LIMITS ]] || die "$LIMITS is missing"
+  case $sub in
+    show) limits_show ;;
+    set) limits_set "$@" ;;
+    edit) "${VISUAL:-${EDITOR:-nano}}" "$LIMITS"; . "$LIMITS"; validate_limits ;;
+    apply)
+      validate_limits
+      apply_terminal
+      apply_builder
+      apply_root ;;
+    *) die "usage: dev limits [show | set KEY=VALUE ... | edit | apply]" ;;
+  esac
+}
+
+# --------------------------------------------------------------- install ----
+
+# Directories (excluding artifacts) that contain file $2 under root $1.
+dirs_with() {
+  local expr=() name
+  for name in "${ARTIFACT_NAMES[@]}"; do expr+=(-o -name "$name"); done
+  find "$1" \( -name .git "${expr[@]}" \) -prune -o -type f -name "$2" -printf '%h\n' 2>/dev/null | sort -u
+}
+
+install_node() {
+  local root=$1 dir
+  have pnpm || { warn "pnpm not found; skipping Node dependencies (install: npm i -g pnpm)"; return 0; }
+  while IFS= read -r dir; do
+    # Workspace members without their own lockfile are installed from the root.
+    if [[ $dir != "$root" ]] && ! has_any "$dir" pnpm-lock.yaml package-lock.json yarn.lock; then
+      continue
+    fi
+    if [[ ! -f $dir/pnpm-lock.yaml ]] && has_any "$dir" package-lock.json yarn.lock; then
+      info "migrating ${dir#"$root"/} to pnpm"
+      if (cd "$dir" && pnpm import >/dev/null); then
+        rm -f "$dir/package-lock.json" "$dir/yarn.lock"
+      else
+        warn "pnpm import failed in $dir; installing from package.json"
+      fi
+    fi
+    # React Native / Expo need a flat node_modules; hoisted still uses the
+    # shared pnpm store, so files are hard-linked rather than copied.
+    if grep -q '"react-native"' "$dir/package.json" && \
+       ! grep -qs '^node-linker' "$dir/.npmrc"; then
+      printf 'node-linker=hoisted\n' >> "$dir/.npmrc"
+      info "added node-linker=hoisted to ${dir#"$root"/}/.npmrc (React Native)"
+    fi
+    info "pnpm install in ${dir/#"$root"/.}"
+    (cd "$dir" && pnpm install) || warn "pnpm install failed in $dir"
+  done < <(dirs_with "$root" package.json)
+}
+
+install_python() {
+  local root=$1 dir
+  have uv || { warn "uv not found; skipping Python dependencies"; return 0; }
+  while IFS= read -r dir; do
+    if [[ -f $dir/pyproject.toml ]] && grep -q '^\[project\]' "$dir/pyproject.toml"; then
+      info "uv sync in ${dir/#"$root"/.}"
+      (cd "$dir" && uv sync) || warn "uv sync failed in $dir"
+    elif [[ -f $dir/requirements.txt ]]; then
+      info "uv pip install -r requirements.txt in ${dir/#"$root"/.}"
+      (cd "$dir" && { [[ -d .venv ]] || uv venv -q; } && uv pip install -r requirements.txt) ||
+        warn "installing requirements.txt failed in $dir"
+    fi
+  done < <({ dirs_with "$root" pyproject.toml; dirs_with "$root" requirements.txt; } | sort -u)
+}
+
+install_go() {
+  local root=$1 dir
+  have go || return 0
+  while IFS= read -r dir; do
+    info "go mod download in ${dir/#"$root"/.}"
+    (cd "$dir" && go mod download) || warn "go mod download failed in $dir"
+  done < <(dirs_with "$root" go.mod)
+}
+
+# -------------------------------------------------------------- commands ----
+
+cmd_activate() {
+  local path="" name="" install=1 force=0 src dest
+  while (($#)); do
+    case $1 in
+      --name) name=${2:?--name needs a value}; shift ;;
+      --no-install) install=0 ;;
+      --force) force=1 ;;
+      -h|--help) usage; return ;;
+      -*) die "unknown option '$1'" ;;
+      *) [[ -z $path ]] || die "only one path allowed"; path=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $path ]] || die "usage: dev activate <path> [--name NAME] [--no-install]"
+  [[ -d $path ]] || die "'$path' is not a directory"
+  src=$(realpath "$path")
+  [[ $src != "$SANDBOX" && $src != "$SANDBOX"/* ]] || die "'$src' is already inside the sandbox"
+  [[ $src != "$HOME" && $src != / && $src != "$HOME/Desktop" ]] || die "refusing to move '$src'"
+  [[ ! -e $src/$KEEP_MARKER ]] || die "'$src' is protected by $KEEP_MARKER"
+  name=${name:-$(basename "$src")}
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid name '$name' (use --name)"
+  dest=$PROJECTS/$name
+  [[ -z $(state_origin "$name") && ! -e $dest ]] ||
+    die "a project named '$name' is already active (use --name)"
+  # The sandbox can be its own capped filesystem; then mv copies the source in.
+  if [[ $(stat -c %d "$src") != $(stat -c %d "$PROJECTS") ]]; then
+    (($(size_of "$src") < $(avail_bytes) - $(gb 1))) ||
+      die "'$src' does not fit in the sandbox filesystem ($(human "$(avail_bytes)") free)"
+    info "copying across filesystems (the sandbox is on its own filesystem)"
+  fi
+  local n o rest
+  while IFS=$'\t' read -r n o rest; do
+    [[ -n $n && $o == "$src"/* ]] && die "active project '$n' came from inside '$src'; deactivate it first"
+  done < "$STATE"
+  check_no_procs "$src" "$force"
+  check_room
+
+  mv -- "$src" "$dest"
+  state_add "$name" "$src"
+  info "moved ${src/#"$HOME"/\~} -> ${dest/#"$HOME"/\~}"
+
+  if ((install)); then
+    install_node "$dest"
+    install_python "$dest"
+    install_go "$dest"
+  fi
+  warn_over_limits "$name"
+  printf '%sready:%s cd %s\n' "$B" "$N" "${dest/#"$HOME"/\~}"
+}
+
+cmd_deactivate() {
+  local arg="" force=0 name origin dir before dir_artifacts gradlew
+  while (($#)); do
+    case $1 in
+      --force) force=1 ;;
+      -h|--help) usage; return ;;
+      -*) die "unknown option '$1'" ;;
+      *) arg=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $arg ]] || die "usage: dev deactivate <name>"
+  name=$(resolve_name "$arg")
+  origin=$(state_origin "$name")
+  dir=$PROJECTS/$name
+  [[ -d $dir ]] || die "$dir is missing; fix $STATE by hand"
+  [[ ! -e $origin ]] || die "'$origin' already exists; move it away first"
+  check_no_procs "$dir" "$force"
+
+  before=$(avail_bytes)
+  while IFS= read -r gradlew; do
+    (cd "$(dirname "$gradlew")" && timeout 60 ./gradlew --stop >/dev/null 2>&1) || true
+  done < <(find "$dir" -name node_modules -prune -o -name gradlew -type f -print 2>/dev/null)
+
+  mapfile -t dir_artifacts < <(find_artifacts "$dir")
+  if ((${#dir_artifacts[@]})); then
+    info "removing ${#dir_artifacts[@]} artifact directories ($(human "$(size_of "${dir_artifacts[@]}")"))"
+    for a in "${dir_artifacts[@]}"; do printf '   %s%s%s\n' "$D" "${a#"$dir"/}" "$N"; remove_dir "$a"; done
+  fi
+
+  mkdir -p "$(dirname "$origin")"
+  # Across filesystems mv copies, so the origin needs room for the project.
+  if [[ $(stat -c %d "$dir") != $(stat -c %d "$(dirname "$origin")") ]]; then
+    (($(size_of "$dir") < $(df --output=avail -B1 "$(dirname "$origin")" | tail -1 | tr -d ' ') - $(gb 1))) ||
+      die "not enough free space at $(dirname "$origin") to move $name back"
+  fi
+  mv -- "$dir" "$origin"
+  state_remove "$name"
+  info "moved back to ${origin/#"$HOME"/\~}"
+
+  prune_caches
+  info "freed $(human $(( $(avail_bytes) - before )))"
+}
+
+prune_caches() {
+  local kinds
+  kinds=$(active_kinds)
+  if have pnpm; then
+    info "pnpm store prune"
+    pnpm store prune >/dev/null 2>&1 || warn "pnpm store prune failed"
+  fi
+  if ! grep -qx node <<< "$kinds" && have npm; then
+    info "npm cache clean (no active Node projects)"
+    npm cache clean --force >/dev/null 2>&1 || warn "npm cache clean failed"
+  fi
+  if have uv; then
+    if grep -qx python <<< "$kinds"; then
+      info "uv cache prune"
+      timeout 120 uv cache prune -q 2>/dev/null || warn "uv cache prune failed (cache in use?)"
+    else
+      info "uv cache clean (no active Python projects)"
+      timeout 120 uv cache clean -q 2>/dev/null || warn "uv cache clean failed (cache in use?)"
+    fi
+  fi
+  if ! grep -qx go <<< "$kinds" && have go; then
+    info "go clean -cache -modcache (no active Go projects)"
+    go clean -cache -testcache -modcache 2>/dev/null || warn "go clean failed"
+  fi
+  if ! grep -qx gradle <<< "$kinds"; then
+    local home=${GRADLE_USER_HOME:-$CACHE/gradle} entry
+    if [[ -d $home ]]; then
+      info "clearing Gradle caches (no active Gradle projects)"
+      # Keep user configuration; everything else is downloaded again on demand.
+      for entry in "$home"/* "$home"/.[!.]*; do
+        [[ -e $entry ]] || continue
+        case $(basename "$entry") in
+          gradle.properties|init.d|init.gradle|init.gradle.kts) ;;
+          *) remove_dir "$entry" ;;
+        esac
+      done
+    fi
+  fi
+}
+
+cmd_prune() {
+  local before
+  ensure_layout
+  before=$(avail_bytes)
+  prune_caches
+  info "freed $(human $(( $(avail_bytes) - before )))"
+}
+
+cmd_clean() {
+  local path="" dry=0 yes=0 root list a total
+  while (($#)); do
+    case $1 in
+      -n|--dry-run) dry=1 ;;
+      -y|--yes) yes=1 ;;
+      -h|--help) usage; return ;;
+      -*) die "unknown option '$1'" ;;
+      *) path=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $path ]] || die "usage: dev clean <path> [--dry-run] [--yes]"
+  [[ -d $path ]] || die "'$path' is not a directory"
+  root=$(realpath "$path")
+  [[ $root != "$PROJECTS" && $root != "$PROJECTS"/* ]] ||
+    die "'$root' is an active project; use 'dev deactivate'"
+  mapfile -t list < <(find_artifacts "$root")
+  if ((${#list[@]} == 0)); then info "nothing to clean in ${root/#"$HOME"/\~}"; return; fi
+
+  for a in "${list[@]}"; do
+    printf '%8s  %s\n' "$(du -sh "$a" 2>/dev/null | cut -f1)" "${a/#"$HOME"/\~}"
+  done
+  total=$(size_of "${list[@]}")
+  printf '%s%8s  total in %d directories%s\n' "$B" "$(human "$total")" "${#list[@]}" "$N"
+  ((dry)) && return
+  ((yes)) || confirm "Delete these directories?" || { info "cancelled"; return; }
+  local before
+  before=$(avail_bytes)
+  for a in "${list[@]}"; do remove_dir "$a"; done
+  info "freed $(human $(( $(avail_bytes) - before )))"
+}
+
+cmd_list() {
+  local n o t
+  ensure_layout
+  if [[ ! -s $STATE ]]; then info "no active projects"; return; fi
+  while IFS=$'\t' read -r n o t; do
+    [[ -n $n ]] || continue
+    printf '%s%s%s\n  path:   %s\n  origin: %s\n  since:  %s\n' "$B" "$n" "$N" \
+      "${PROJECTS/#"$HOME"/\~}/$n" "${o/#"$HOME"/\~}" "${t%%T*}"
+  done < "$STATE"
+}
+
+cmd_path() {
+  local name
+  name=$(resolve_name "${1:?usage: dev path <name>}")
+  printf '%s\n' "$PROJECTS/$name"
+}
+
+cache_dirs() {
+  printf '%s\n' "npm=$CACHE/npm" "pnpm=$CACHE/pnpm-store" "uv=$CACHE/uv" \
+    "go-build=$CACHE/go-build" "go-mod=$CACHE/go-mod" "gradle=$CACHE/gradle"
+}
+
+cmd_status() {
+  local n o t entry label dir total=0 size
+  ensure_layout
+  printf '%sACTIVE PROJECTS%s\n' "$B" "$N"
+  if [[ ! -s $STATE ]]; then
+    printf '  %snone%s\n' "$D" "$N"
+  else
+    while IFS=$'\t' read -r n o t; do
+      [[ -n $n ]] || continue
+      printf '  %-28s %8s  %sfrom %s%s\n' "$n" "$(du -sh "$PROJECTS/$n" 2>/dev/null | cut -f1)" \
+        "$D" "${o/#"$HOME"/\~}" "$N"
+    done < "$STATE"
+  fi
+
+  printf '\n%sSHARED CACHES%s  %s%s%s\n' "$B" "$N" "$D" "${CACHE/#"$HOME"/\~}" "$N"
+  while IFS= read -r entry; do
+    label=${entry%%=*} dir=${entry#*=}
+    size=$(size_of "$dir")
+    total=$((total + size))
+    printf '  %-28s %8s\n' "$label" "$(human "$size")"
+  done < <(cache_dirs)
+  printf '  %-28s %8s\n' "total" "$(human "$total")"
+
+  printf '\n%sLIMITS%s  %s%s%s\n' "$B" "$N" "$D" "${SANDBOX/#"$HOME"/\~}/limits.conf" "$N"
+  limit_line "sandbox (projects + cache)" "$(size_of "$PROJECTS" "$CACHE")" "$(gb "$LIMIT_SANDBOX_GB")"
+  while IFS=$'\t' read -r n o t; do
+    [[ -n $n ]] || continue
+    limit_line "$n" "$(size_of "$PROJECTS/$n")" "$(gb "$LIMIT_PROJECT_GB")"
+  done < "$STATE"
+
+  printf '\n%sGLOBAL TOOLS%s\n' "$B" "$N"
+  if have uv; then
+    printf '  uv tool:  %s\n' "$(uv tool list 2>/dev/null | grep -v '^-' | awk '{print $1}' | paste -sd' ' -)"
+  fi
+  if have npm; then
+    printf '  npm -g:   %s\n' "$(npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 |
+      sed -E 's#.*/node_modules/##' | grep -vxE 'npm|corepack' | paste -sd' ' -)"
+  fi
+  if [[ -d $HOME/go/bin ]]; then
+    printf '  go/bin:   %s\n' "$(ls "$HOME/go/bin" | paste -sd' ' -)"
+  fi
+
+  printf '\n%sDISK%s\n  %s free on the host disk %s(minimum %sGB, warning below %sGB)%s\n' "$B" "$N" \
+    "$(human "$(host_avail_bytes)")" "$D" "$MIN_FREE_GB" "$WARN_FREE_GB" "$N"
+  if mountpoint -q "$SANDBOX"; then
+    printf '  %s free in the sandbox filesystem %s(capped at %s)%s\n' \
+      "$(human "$(avail_bytes)")" "$D" "$(human "$(df --output=size -B1 "$SANDBOX" | tail -1 | tr -d ' ')")" "$N"
+  else
+    printf '  %sthe sandbox is not on its own capped filesystem%s\n' "$D" "$N"
+  fi
+}
+
+# Notifies when free disk space crosses a threshold; run by dev-watchdog.timer.
+cmd_watchdog() {
+  local free sbfree level=ok last="" file="$SANDBOX/state/watchdog" msg what urgency=normal
+  ensure_layout
+  free=$(host_avail_bytes)
+  what="$(human "$free") of the host disk"
+  if ((free < $(gb "$CRITICAL_FREE_GB"))); then level=critical
+  elif ((free < $(gb "$WARN_FREE_GB"))); then level=warning
+  fi
+  # A capped sandbox filesystem can fill up while the host disk is fine.
+  if mountpoint -q "$SANDBOX"; then
+    sbfree=$(avail_bytes)
+    if ((sbfree < $(gb "$FS_CRITICAL_FREE_GB"))); then
+      level=critical what="$(human "$sbfree") of the sandbox filesystem"
+    elif ((sbfree < $(gb "$FS_WARN_FREE_GB"))) && [[ $level == ok ]]; then
+      level=warning what="$(human "$sbfree") of the sandbox filesystem"
+    fi
+  fi
+  [[ $level == critical ]] && urgency=critical
+  [[ -f $file ]] && last=$(<"$file")
+  printf '%s\n' "$level" > "$file"
+  printf '%s: %s free\n' "$level" "$what"
+  # Only notify when the level changes, so a full disk does not spam.
+  [[ $level == ok || $level == "$last" ]] && return 0
+  msg="Only $what left. Run 'dev status' and free space (dev prune, docker system prune)."
+  [[ $level == critical && $what == *"host disk" && -f $BALLAST ]] &&
+    msg+=" Emergency: delete $BALLAST to get ${BALLAST_GB}GB back."
+  logger -t dev-watchdog "$level: $msg" || true
+  if have notify-send; then notify-send -u "$urgency" "Disk space $level" "$msg" || true; fi
+}
+
+cmd_doctor() {
+  local issues=0 dir entry root list total
+  ensure_layout
+  note() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; issues=$((issues + 1)); }
+
+  printf '%sCONFIGURATION%s\n' "$B" "$N"
+  have pnpm || note "pnpm is not installed (npm i -g pnpm)"
+  have uv || note "uv is not installed"
+  if have npm && [[ $(npm config get cache 2>/dev/null) != "$CACHE/npm" ]]; then
+    note "npm cache is not in the sandbox: npm config set cache $CACHE/npm"
+  fi
+  if have pnpm && [[ $(pnpm config get store-dir 2>/dev/null) != "$CACHE/pnpm-store" ]]; then
+    note "pnpm store is not in the sandbox: pnpm config set store-dir $CACHE/pnpm-store --global"
+  fi
+  if have uv && [[ $(uv cache dir 2>/dev/null) != "$CACHE/uv" ]]; then
+    note "uv cache is not in the sandbox: set cache-dir in ~/.config/uv/uv.toml"
+  fi
+  if have go; then
+    [[ $(go env GOMODCACHE) == "$CACHE/go-mod" ]] || note "go env -w GOMODCACHE=$CACHE/go-mod"
+    [[ $(go env GOCACHE) == "$CACHE/go-build" ]] || note "go env -w GOCACHE=$CACHE/go-build"
+  fi
+  mountpoint -q "$SANDBOX" || note "the sandbox is not on its own capped filesystem (see $SANDBOX/system/image/migrate.sh)"
+  [[ ${GRADLE_USER_HOME:-} == "$CACHE/gradle" ]] || note "GRADLE_USER_HOME is not $CACHE/gradle (source $SANDBOX/env.sh)"
+  [[ ${PIP_REQUIRE_VIRTUALENV:-} == true ]] || note "PIP_REQUIRE_VIRTUALENV is not set (global pip installs are allowed)"
+  if have conda || [[ -d $HOME/miniconda3 || -d $HOME/anaconda3 ]]; then
+    note "conda is installed; use uv (or pixi for conda packages) instead"
+  fi
+  ((issues)) || printf '  %sok%s\n' "$G" "$N"
+
+  printf '\n%sLEGACY CACHES OUTSIDE THE SANDBOX%s\n' "$B" "$N"
+  local found=0
+  for dir in "$HOME/.npm" "$HOME/.local/share/pnpm/store" "$HOME/.cache/pnpm" "$HOME/.cache/uv" \
+             "$HOME/.cache/go-build" "$HOME/go/pkg/mod" "$HOME/.gradle" "$HOME/.cache/pip"; do
+    if [[ -d $dir ]]; then
+      note "$(printf '%-34s %8s' "${dir/#"$HOME"/\~}" "$(du -sh "$dir" 2>/dev/null | cut -f1)")"
+      found=1
+    fi
+  done
+  ((found)) || printf '  %snone%s\n' "$G" "$N"
+
+  printf '\n%sSTRAY PYTHON ENVIRONMENTS%s\n' "$B" "$N"
+  found=0
+  local skip=()
+  for root in "${PROJECT_ROOTS[@]}"; do [[ -d $root ]] && keep_prunes "$root" skip; done
+  while IFS= read -r entry; do
+    dir=$(dirname "$entry")
+    note "$(printf '%-50s %8s' "${dir/#"$HOME"/\~}" "$(du -sh "$dir" 2>/dev/null | cut -f1)")"
+    found=1
+  # Hidden directories in $HOME belong to applications that manage their own envs.
+  done < <(find "$HOME" -maxdepth 7 "${skip[@]}" \( -path "$PROJECTS" -o -path "$CACHE" \
+             -o -path "$HOME/.*" -o -path "$HOME/snap" -o -name node_modules -o -name .git \) -prune \
+             -o -name pyvenv.cfg -type f -print 2>/dev/null)
+  ((found)) || printf '  %snone%s\n' "$G" "$N"
+
+  printf '\n%sLIMITS%s\n' "$B" "$N"
+  found=0
+  local used n o t free
+  used=$(size_of "$PROJECTS" "$CACHE")
+  if ((used * 100 >= $(gb "$LIMIT_SANDBOX_GB") * 80)); then
+    note "sandbox uses $(human "$used") of ${LIMIT_SANDBOX_GB}GB"
+    found=1
+  fi
+  while IFS=$'\t' read -r n o t; do
+    [[ -n $n ]] || continue
+    used=$(size_of "$PROJECTS/$n")
+    if ((used * 100 >= $(gb "$LIMIT_PROJECT_GB") * 80)); then
+      note "$n uses $(human "$used") of ${LIMIT_PROJECT_GB}GB"
+      found=1
+    fi
+  done < "$STATE"
+  free=$(avail_bytes)
+  if ((free < $(gb "$WARN_FREE_GB"))); then
+    note "only $(human "$free") of disk space is free (warning below ${WARN_FREE_GB}GB)"
+    found=1
+  fi
+  ((found)) || printf '  %sok%s\n' "$G" "$N"
+
+  printf '\n%sINACTIVE PROJECTS WITH ARTIFACTS%s\n' "$B" "$N"
+  found=0
+  for root in "${PROJECT_ROOTS[@]}"; do
+    [[ -d $root ]] || continue
+    mapfile -t list < <(find_artifacts "$root")
+    ((${#list[@]})) || continue
+    total=$(size_of "${list[@]}")
+    note "$(printf '%-50s %8s' "${root/#"$HOME"/\~}" "$(human "$total")")  -> dev clean ${root/#"$HOME"/\~}"
+    found=1
+  done
+  ((found)) || printf '  %snone%s\n' "$G" "$N"
+
+  printf '\n'
+  if ((issues)); then warn "$issues issue(s) found"; else info "everything looks good"; fi
+}
+
+# ------------------------------------------------------------------ main ----
+
+main() {
+  local cmd=${1:-}
+  (($#)) && shift
+  case $cmd in
+    activate|a)   ensure_layout; cmd_activate "$@" ;;
+    deactivate|d) ensure_layout; cmd_deactivate "$@" ;;
+    status|st)    cmd_status ;;
+    list|ls)      cmd_list ;;
+    path)         ensure_layout; cmd_path "$@" ;;
+    clean)        ensure_layout; cmd_clean "$@" ;;
+    prune)        cmd_prune ;;
+    doctor)       cmd_doctor ;;
+    watchdog)     cmd_watchdog ;;
+    limits)       ensure_layout; cmd_limits "$@" ;;
+    ""|-h|--help|help) usage ;;
+    -V|--version|version) printf 'dev %s\n' "$VERSION" ;;
+    *) die "unknown command '$cmd' (see 'dev --help')" ;;
+  esac
+}
+
+main "$@"

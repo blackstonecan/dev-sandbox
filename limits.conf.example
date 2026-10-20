@@ -1,0 +1,68 @@
+# All limits of the dev sandbox, in one place. Plain shell assignments.
+# install.sh copies this file to limits.conf and sizes the CPU and build
+# values for your machine; edit limits.conf, not this file.
+#
+#   dev limits                 show these values next to what is live
+#   dev limits set KEY=VALUE   change one or more values (then run apply)
+#   dev limits edit            open limits.conf in $EDITOR
+#   dev limits apply           apply everything; prints one sudo command when
+#                              a root-level limit (Docker slice, user slice,
+#                              sandbox image) changed
+#
+# Sizes: whole numbers with K, M, G or T (20G). Slice memory also takes a
+# percentage of RAM (80%). CPU: number of cores (4 = 400%).
+
+# ---- Disk: soft limits enforced by `dev` (whole GB) -------------------------
+# Everything under projects/ and cache/ (hard links counted once).
+LIMIT_SANDBOX_GB=40
+# One project in projects/ (counted like `du`, so hard-linked pnpm files count).
+LIMIT_PROJECT_GB=10
+# `dev activate` refuses when the disk has less free space than this.
+MIN_FREE_GB=10
+# The watchdog notifies below these amounts of free disk space.
+WARN_FREE_GB=15
+CRITICAL_FREE_GB=5
+# When the sandbox is its own capped filesystem (an image file), the watchdog
+# also notifies when that filesystem has less free space than this.
+FS_WARN_FREE_GB=5
+FS_CRITICAL_FREE_GB=2
+
+# ---- Disk: hard cap (sudo) ---------------------------------------------------
+# Size of the ext4 image that system/image/migrate.sh mounts on the sandbox.
+# Can only grow once created; shrinking needs the image unmounted.
+SANDBOX_IMAGE_GB=50
+
+# ---- Terminal sessions: systemd user slice (no sudo) ------------------------
+# Everything started from your terminal windows (builds, installs, AI agents).
+# install.sh detects the slice your terminal runs in.
+TERM_SLICE=app-org.gnome.Terminal.slice
+# Soft limit: above this the kernel throttles and reclaims instead of killing.
+TERM_MEMORY_HIGH=65%
+# Hard limit: the OOM killer acts inside this slice, not on the desktop.
+TERM_MEMORY_MAX=80%
+TERM_SWAP_MAX=4G
+# Fork-bomb guard.
+TERM_TASKS_MAX=20000
+# Dev work yields to the desktop when both compete (default weight is 100).
+TERM_CPU_WEIGHT=50
+TERM_CPU_CORES=4
+
+# ---- Docker containers: dockerdev.slice (sudo) ------------------------------
+DOCKER_MEMORY_HIGH=35%
+DOCKER_MEMORY_MAX=45%
+DOCKER_SWAP_MAX=2G
+DOCKER_TASKS_MAX=16384
+DOCKER_CPU_WEIGHT=50
+DOCKER_CPU_CORES=4
+
+# ---- Docker builds: the "capped" buildx builder (no sudo) -------------------
+# Applying a change recreates the builder, which drops its build cache.
+BUILD_MEMORY=4G
+BUILD_MEMORY_SWAP=6G
+BUILD_CPU_CORES=2
+BUILD_CACHE_GB=10
+
+# ---- Whole user session: user-<uid>.slice (sudo) ----------------------------
+# Last-resort backstop for everything you run, desktop included.
+USER_MEMORY_HIGH=85%
+USER_MEMORY_MAX=90%
