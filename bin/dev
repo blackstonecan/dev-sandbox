@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # dev - development sandbox manager.
 #
-# Active projects live in ~/sandbox/projects and keep their dependencies and
+# Active projects live in ~/dev-sandbox/projects and keep their dependencies and
 # build outputs. Inactive projects live anywhere else and keep only source code.
-# Shared package caches (npm, pnpm, uv, Go, Gradle) live in ~/sandbox/cache and
+# Shared package caches (npm, pnpm, uv, Go, Gradle) live in ~/dev-sandbox/cache and
 # are pruned whenever a project is deactivated.
 
 set -euo pipefail
 
 VERSION="1.2.0"
-SANDBOX="${DEV_SANDBOX:-$HOME/sandbox}"
+SANDBOX="${DEV_SANDBOX:-$HOME/dev-sandbox}"
 PROJECTS="$SANDBOX/projects"
 STATE="$SANDBOX/state/projects.tsv"
 CACHE="$SANDBOX/cache"

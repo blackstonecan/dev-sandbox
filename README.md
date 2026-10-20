@@ -1,4 +1,4 @@
-# sandbox
+# dev-sandbox
 
 A development sandbox for Linux laptops and workstations: dependencies only for
 the projects you are working on, and hard caps on the disk, memory and CPU that
@@ -11,13 +11,13 @@ Plain bash on top of systemd and cgroup v2; no daemon, no containers needed.
 ## What it does
 
 **Projects.** `dev activate ~/projects/app` moves a project into
-`~/sandbox/projects/app` and installs its dependencies. `dev deactivate app`
+`~/dev-sandbox/projects/app` and installs its dependencies. `dev deactivate app`
 deletes `node_modules`, `.venv`, `dist`, `target` and friends, moves the
 project back and prunes the shared caches. Inactive projects keep only source
 code, so dozens of them cost almost no disk.
 
 **Shared caches.** npm, pnpm, uv, Go and Gradle caches all live in
-`~/sandbox/cache`, so they are counted, capped and pruned together.
+`~/dev-sandbox/cache`, so they are counted, capped and pruned together.
 
 **Limits, all in one file.** `limits.conf` sets:
 
@@ -27,7 +27,7 @@ code, so dozens of them cost almost no disk.
 | Docker containers | RAM, swap, tasks, CPU | `dockerdev.slice` via `cgroup-parent` |
 | Docker builds | RAM, swap, CPU, build cache | a `docker-container` buildx builder |
 | Your whole session | RAM backstop | `user-<uid>.slice` |
-| Sandbox disk | hard cap | ext4 image file mounted on `~/sandbox` |
+| Sandbox disk | hard cap | ext4 image file mounted on `~/dev-sandbox` |
 | Sandbox disk | soft caps per project / total | checked by `dev activate`, `status`, `doctor` |
 | Host disk | free-space alerts | user timer + desktop notification |
 
@@ -44,8 +44,8 @@ killed alone, instead of the kernel picking a victim on your desktop.
 ## Install
 
 ```sh
-git clone <this repo> ~/sandbox
-~/sandbox/install.sh
+git clone https://github.com/<you>/dev-sandbox.git ~/dev-sandbox
+~/dev-sandbox/install.sh
 ```
 
 The installer never uses `sudo`. It:
@@ -53,7 +53,7 @@ The installer never uses `sudo`. It:
 - creates `limits.conf` sized for your CPU count and RAM, and detects the
   systemd slice your terminal runs in (run it from the terminal you develop in)
 - links `dev` into `~/.local/bin` and sources `env.sh` from `~/.bashrc`/`~/.zshrc`
-- points npm, pnpm, uv and Go caches into `~/sandbox/cache`
+- points npm, pnpm, uv and Go caches into `~/dev-sandbox/cache`
 - enables the disk watchdog timer
 - creates the capped Docker builder and applies the terminal limits
 - links the Claude Code skill into `~/.claude/skills` if `~/.claude` exists
@@ -64,13 +64,13 @@ can delete to get space back when the disk is full).
 It then prints the optional root-level steps, which you run yourself:
 
 ```sh
-sudo bash ~/sandbox/system/docker/apply.sh          # Docker slice + session backstop
-cd ~ && sudo bash ~/sandbox/system/image/migrate.sh # hard disk cap
+sudo bash ~/dev-sandbox/system/docker/apply.sh          # Docker slice + session backstop
+cd ~ && sudo bash ~/dev-sandbox/system/image/migrate.sh # hard disk cap
 ```
 
 `migrate.sh` creates a sparse ext4 image of `SANDBOX_IMAGE_GB`, copies the
 sandbox into it (keeping pnpm hard links), adds it to `/etc/fstab` and mounts
-it over `~/sandbox`. The old tree is kept as `~/sandbox.old` until you delete
+it over `~/dev-sandbox`. The old tree is kept as `~/dev-sandbox.old` until you delete
 it. `system/image/revert.sh` undoes it.
 
 ## Usage
@@ -97,7 +97,7 @@ $ dev limits apply
 -> terminal sessions: app-org.gnome.Terminal.slice updated
 -> docker builds: unchanged
 -> needs root (Docker slice); run it yourself:
-   sudo bash ~/sandbox/system/apply-root.sh
+   sudo bash ~/dev-sandbox/system/apply-root.sh
 ```
 
 `apply-root.sh` parses `limits.conf` instead of sourcing it, so nothing in that
@@ -136,7 +136,7 @@ so they never touch real projects or caches.
 ## Uninstall
 
 ```sh
-~/sandbox/uninstall.sh
+~/dev-sandbox/uninstall.sh
 ```
 
 Removes the watchdog, terminal limits, `dev` link, shell block, skill link and

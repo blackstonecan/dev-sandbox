@@ -7,7 +7,7 @@ description: Rules for installing dependencies and managing projects on this mac
 
 This machine keeps dependencies only for projects that are actively being
 worked on, and caps the disk, memory and CPU that development work can use.
-The sandbox lives in `$DEV_SANDBOX` (default `~/sandbox`).
+The sandbox lives in `$DEV_SANDBOX` (default `~/dev-sandbox`).
 
 - **Active projects** live in `$DEV_SANDBOX/projects/<name>` and keep their
   dependencies and build outputs.
