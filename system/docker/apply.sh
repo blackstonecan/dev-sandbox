@@ -6,6 +6,10 @@
 #   sudo bash <sandbox>/system/docker/apply.sh
 # It restarts Docker once; containers that were running are started again.
 # Undo with revert.sh in this directory.
+#
+# Rootful Docker only. Prefer rootless Docker (README): the docker group is
+# root without a password. For rootless Docker, `dev limits apply` does all
+# of this without sudo.
 set -euo pipefail
 
 src=$(dirname "$(readlink -f "$0")")
@@ -17,7 +21,7 @@ if pgrep -f 'docker (build|buildx)' >/dev/null; then
 fi
 
 # The slice must exist before Docker is told to use it.
-bash "$src/../apply-root.sh"
+bash "$src/../apply-root.sh" --docker
 
 install -d -m 0755 /etc/docker
 if [[ -e /etc/docker/daemon.json ]]; then

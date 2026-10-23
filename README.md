@@ -24,7 +24,7 @@ code, so dozens of them cost almost no disk.
 | Scope | What | How |
 | --- | --- | --- |
 | Terminal windows | RAM, swap, tasks, CPU | systemd user slice of your terminal |
-| Docker containers | RAM, swap, tasks, CPU | `dockerdev.slice` via `cgroup-parent` |
+| Docker containers | RAM, swap, tasks, CPU | `dockerdev.slice` via `cgroup-parent` (a user slice for rootless Docker) |
 | Docker builds | RAM, swap, CPU, build cache | a `docker-container` buildx builder |
 | Your whole session | RAM backstop | `user-<uid>.slice` |
 | Sandbox disk | hard cap | ext4 image file mounted on `~/dev-sandbox` |
@@ -39,7 +39,7 @@ killed alone, instead of the kernel picking a victim on your desktop.
 
 - Linux with systemd and cgroup v2 (any current Ubuntu, Fedora, Debian, Arch)
 - bash 4.3+, coreutils, findutils, python3 (only for the Docker step)
-- Optional: pnpm, uv, Go, Gradle, Docker
+- Optional: pnpm, uv, Go, Gradle, Docker (rootless recommended; see below)
 
 ## Install
 
@@ -57,7 +57,8 @@ The installer never uses `sudo`. It:
   in `~/.config/pnpm/config.yaml` for pnpm 11, `store-dir` in
   `~/.config/pnpm/rc` for pnpm 10)
 - enables the disk watchdog timer
-- creates the capped Docker builder and applies the terminal limits
+- creates the capped Docker builder and applies the terminal limits (and,
+  for rootless Docker, the container limits)
 - links the Claude Code skill into `~/.claude/skills` if `~/.claude` exists
 
 Options: `--no-docker`, `--no-caches`, `--no-skill`, `--ballast GB` (a file you
@@ -66,9 +67,13 @@ can delete to get space back when the disk is full).
 It then prints the optional root-level steps, which you run yourself:
 
 ```sh
-sudo bash ~/dev-sandbox/system/docker/apply.sh          # Docker slice + session backstop
+sudo bash ~/dev-sandbox/system/apply-root.sh            # session backstop
 cd ~ && sudo bash ~/dev-sandbox/system/image/migrate.sh # hard disk cap
 ```
+
+With rootful Docker it prints `system/docker/apply.sh` instead of
+`apply-root.sh` (Docker slice + session backstop), and suggests rootless
+Docker.
 
 `migrate.sh` creates a sparse ext4 image of `SANDBOX_IMAGE_GB`, copies the
 sandbox into it (keeping pnpm hard links), adds it to `/etc/fstab` and mounts
@@ -97,13 +102,55 @@ included) and, when a root-level limit changed, prints the one command to run:
 $ dev limits set TERM_MEMORY_MAX=24G DOCKER_CPU_CORES=6
 $ dev limits apply
 -> terminal sessions: app-org.gnome.Terminal.slice updated
+-> docker containers: dockerdev.slice updated (containers made before the cap: see dev doctor)
 -> docker builds: unchanged
--> needs root (Docker slice); run it yourself:
-   sudo bash ~/dev-sandbox/system/apply-root.sh
+-> root-level limits: unchanged
 ```
+
+With rootful Docker the container limits are root-level instead, and the last
+line becomes `needs root (Docker slice); run it yourself: sudo bash
+~/dev-sandbox/system/apply-root.sh`.
 
 `apply-root.sh` parses `limits.conf` instead of sourcing it, so nothing in that
 file ever runs as root. It only ever grows the disk image.
+
+## Rootless Docker
+
+Use Docker in rootless mode. With the usual rootful setup, the `docker` group
+is root without a password: `docker run -v /:/host ...` gives any process of
+yours, an AI agent included, every file on the machine, such as the store and
+key of a secret broker like secretd. Rootless Docker runs the daemon as your
+user, so a container can reach nothing you cannot.
+
+It also keeps all limits user-level: containers run under your systemd user
+manager, and `dev limits apply` writes `~/.config/systemd/user/dockerdev.slice`
+and merges `cgroup-parent`, log rotation and builder GC into
+`~/.config/docker/daemon.json` (other keys are kept), with no sudo. It
+restarts Docker once when that file changes. A container keeps the cgroup it
+was created with, so recreate the ones made before
+(`docker compose up -d --force-recreate`); `dev doctor` lists them.
+
+Switching from rootful Docker (Ubuntu; images and volumes do not carry over,
+so dump the databases you need first):
+
+```sh
+sudo apt install uidmap                                  # newuidmap, newgidmap
+docker buildx use default && docker buildx rm capped
+sudo systemctl disable --now docker.service docker.socket containerd.service
+sudo rm /var/run/docker.sock
+dockerd-rootless-setuptool.sh install                    # as your user
+sudo loginctl enable-linger $USER                        # start it at boot
+sudo gpasswd -d $USER docker
+dev limits apply && bash ~/dev-sandbox/system/docker/setup-builder.sh
+```
+
+Then **reboot**: with lingering on, your systemd user manager survives a
+logout and keeps the old groups, and terminals started from it inherit them.
+`id | grep -c docker` must print 0. `dev doctor` warns while you are in the
+`docker` group or rootful Docker is reachable.
+
+Rootless limits: ports below 1024 need extra setup, and `live-restore` is not
+used (containers restart with the daemon).
 
 ## Safety
 

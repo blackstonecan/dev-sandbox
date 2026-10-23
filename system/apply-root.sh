@@ -4,7 +4,9 @@
 #   sudo bash <sandbox>/system/apply-root.sh
 #
 # - installs dockerdev.slice (Docker containers and builds), which
-#   `dev limits apply` generates from DOCKER_*
+#   `dev limits apply` generates from DOCKER_*, when Docker runs as root
+#   (docker.service is enabled, or --docker). Rootless Docker uses a
+#   user-level slice that `dev limits apply` sets up without sudo.
 # - sets the user-<uid>.slice backstop from USER_*
 # - grows the sandbox image to SANDBOX_IMAGE_GB (never shrinks it)
 # Values are parsed, not sourced, so nothing in limits.conf runs as root.
@@ -34,15 +36,24 @@ user_high=$(val USER_MEMORY_HIGH "$mem")
 user_max=$(val USER_MEMORY_MAX "$mem")
 image_gb=$(val SANDBOX_IMAGE_GB '^[1-9][0-9]*$')
 
-# Docker slice: only the settings `dev` generates may be in the file.
-[[ -f $slice ]] || die "$slice is missing; run 'dev limits apply' first"
-if grep -vqE '^(#.*|\[Unit\]|\[Slice\]|Description=[^$`]*|Before=slices\.target|Memory(High|Max|SwapMax)=[0-9]+[KMGT%]?|TasksMax=[0-9]+|CPUWeight=[0-9]+|CPUQuota=[0-9]+%|)$' "$slice"; then
-  die "$slice has unexpected lines; regenerate it with 'dev limits apply'"
+rootful=0
+if [[ ${1:-} == --docker ]] || systemctl is-enabled --quiet docker.service 2>/dev/null; then
+  rootful=1
 fi
-if ! cmp -s "$slice" /etc/systemd/system/dockerdev.slice; then
-  install -m 0644 "$slice" /etc/systemd/system/dockerdev.slice
-  systemctl daemon-reload
-  echo "dockerdev.slice installed"
+
+# Docker slice: only the settings `dev` generates may be in the file.
+if ((rootful)); then
+  [[ -f $slice ]] || die "$slice is missing; run 'dev limits apply' first"
+  if grep -vqE '^(#.*|\[Unit\]|\[Slice\]|Description=[^$`]*|Before=slices\.target|Memory(High|Max|SwapMax)=[0-9]+[KMGT%]?|TasksMax=[0-9]+|CPUWeight=[0-9]+|CPUQuota=[0-9]+%|)$' "$slice"; then
+    die "$slice has unexpected lines; regenerate it with 'dev limits apply'"
+  fi
+  if ! cmp -s "$slice" /etc/systemd/system/dockerdev.slice; then
+    install -m 0644 "$slice" /etc/systemd/system/dockerdev.slice
+    systemctl daemon-reload
+    echo "dockerdev.slice installed"
+  fi
+else
+  echo "rootful Docker is not enabled; system dockerdev.slice skipped"
 fi
 
 # User slice: set-property persists in /etc/systemd/system.control.
@@ -67,5 +78,7 @@ if [[ -f $img ]]; then
 fi
 
 echo
-systemctl show dockerdev.slice -p MemoryHigh -p MemoryMax -p MemorySwapMax -p TasksMax -p CPUWeight -p CPUQuotaPerSecUSec
+if ((rootful)); then
+  systemctl show dockerdev.slice -p MemoryHigh -p MemoryMax -p MemorySwapMax -p TasksMax -p CPUWeight -p CPUQuotaPerSecUSec
+fi
 df -h "$sb" | tail -1

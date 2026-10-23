@@ -39,7 +39,8 @@ The `dev` CLI manages all of this. Run `dev --help` for full usage.
   and asks first. `--dry-run`: only list. `--yes`: do not ask.
 - `dev prune`: runs only the cache pruning step.
 - `dev doctor`: checks cache configuration, legacy caches outside the sandbox,
-  stray venvs, inactive projects that still hold artifacts, and limits.
+  stray venvs, Docker (rootful Docker, `docker` group membership, containers
+  outside the cap), inactive projects that still hold artifacts, and limits.
 - `dev limits [show | set KEY=VALUE ... | edit | apply]`: every limit (disk,
   RAM/swap/CPU for terminals, Docker containers, Docker builds, the user slice,
   the sandbox image size) lives in `$DEV_SANDBOX/limits.conf`. `apply` applies
@@ -74,6 +75,16 @@ The `dev` CLI manages all of this. Run `dev --help` for full usage.
   the user to run.
 - A build or test killed by the OOM killer inside the terminal slice means the
   limit was hit; tell the user instead of retrying in a loop.
+
+### Docker
+- Docker should run **rootless** (as the user; `dev doctor` warns otherwise).
+  Never suggest adding the user to the
+  `docker` group, `sudo docker`, or switching back to rootful Docker: the
+  `docker` group is root without a password.
+- Containers are capped by `dockerdev.slice` only when they are created after
+  `dev limits apply`. If `dev doctor` lists an uncapped container, suggest
+  recreating it (`docker compose up -d --force-recreate`); do not just restart.
+- Builds use the capped buildx builder (`BUILDX_BUILDER=capped`).
 
 ### Node.js
 - Use **pnpm**: `pnpm install`, `pnpm add <pkg>`, `pnpm add -D <pkg>`,

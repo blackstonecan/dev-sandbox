@@ -113,6 +113,55 @@ mkdir -p "$T/sb/.pnpm-store/v11"
 check "doctor reports a stray pnpm store" bash -c "$(declare -f dev); T='$T' repo='$repo'; dev doctor 2>&1 | grep -q 'stray pnpm store'"
 rmdir "$T/sb/.pnpm-store/v11" "$T/sb/.pnpm-store"
 
+echo "docker"
+# Fake docker, systemctl and id: the mode, groups and container come from files
+# in $T, and systemctl only logs its arguments.
+mkdir -p "$T/dbin"
+printf '%s\n' '#!/bin/sh' \
+  "case \"\$1 \$2\" in" \
+  "  'info --format') cat '$T/docker-mode' 2>/dev/null || exit 1 ;;" \
+  "  'ps -q') echo abc ;;" \
+  "  'inspect -f') echo /db 1 ;;" \
+  "  *) exit 1 ;;" \
+  "esac" > "$T/dbin/docker"
+printf '%s\n' '#!/bin/sh' "echo \"\$*\" >> '$T/systemctl.log'" > "$T/dbin/systemctl"
+printf '%s\n' '#!/bin/sh' "if [ \"\$1\" = -un ]; then echo tester; else cat '$T/groups'; fi" > "$T/dbin/id"
+chmod +x "$T/dbin/docker" "$T/dbin/systemctl" "$T/dbin/id"
+dev_docker() {
+  env -i HOME="$T/home" PATH="$T/dbin:/usr/bin:/bin" DEV_SANDBOX="$T/sb" \
+    DEV_PROJECT_ROOTS="$T/home/projects" bash "$repo/bin/dev" "$@" </dev/null
+}
+# A copy, as `dev limits apply` writes generated files into system/docker.
+cp -r "$repo/system" "$T/sb/system"
+dconf=$T/home/.config/docker/daemon.json
+mkdir -p "$(dirname "$dconf")"
+printf '{"dns": ["1.1.1.1"]}\n' > "$dconf"
+printf '["name=seccomp,profile=builtin","name=rootless"]\n' > "$T/docker-mode"
+out=$(dev_docker limits apply 2>&1)
+check "rootless apply writes the user slice" grep -qx 'MemoryMax=45%' "$T/home/.config/systemd/user/dockerdev.slice"
+check "rootless apply sets cgroup-parent" grep -q '"cgroup-parent": "dockerdev.slice"' "$dconf"
+check "rootless apply keeps other daemon.json keys" grep -q '"dns"' "$dconf"
+check "rootless apply leaves out live-restore" bash -c "! grep -q live-restore '$dconf'"
+check "rootless apply restarts Docker when daemon.json changes" grep -qx -- '--user restart docker' "$T/systemctl.log"
+check "rootless apply needs no root for Docker" bash -c "! grep -q 'Docker slice' <<< '$out'"
+: > "$T/systemctl.log"
+dev_docker limits apply >/dev/null 2>&1
+check "a second apply does not restart Docker" bash -c "! grep -q restart '$T/systemctl.log'"
+printf '["name=seccomp,profile=builtin"]\n' > "$T/docker-mode"
+rm "$T/home/.config/systemd/user/dockerdev.slice"
+out=$(dev_docker limits apply 2>&1)
+check "rootful apply asks for the system Docker slice" grep -q 'Docker slice' <<< "$out"
+check "rootful apply writes no user slice" test ! -e "$T/home/.config/systemd/user/dockerdev.slice"
+printf 'tester docker\n' > "$T/groups"
+out=$(dev_docker doctor 2>&1)
+check "doctor reports the docker group" grep -q 'is in the docker group' <<< "$out"
+check "doctor reports rootful Docker" grep -q 'Docker runs as root' <<< "$out"
+printf 'tester\n' > "$T/groups"
+printf '["name=rootless"]\n' > "$T/docker-mode"
+out=$(dev_docker doctor 2>&1)
+check "doctor is quiet about groups without docker" bash -c "! grep -q 'docker group' <<< '$out'"
+check "doctor reports an uncapped container" grep -q 'container db is not capped' <<< "$out"
+
 echo "install.sh set_line"
 eval "$(sed -n '/^set_line()/,/^}/p' "$repo/install.sh")"
 printf 'only-built-dependencies=x\nstore-dir=/old\n' > "$T/rc"

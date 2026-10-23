@@ -6,7 +6,7 @@
 #   dev limits set KEY=VALUE   change one or more values (then run apply)
 #   dev limits edit            open limits.conf in $EDITOR
 #   dev limits apply           apply everything; prints one sudo command when
-#                              a root-level limit (Docker slice, user slice,
+#                              a root-level limit (rootful Docker slice, user slice,
 #                              sandbox image) changed
 #
 # Sizes: whole numbers with K, M, G or T (20G). Slice memory also takes a
@@ -47,7 +47,9 @@ TERM_TASKS_MAX=20000
 TERM_CPU_WEIGHT=50
 TERM_CPU_CORES=4
 
-# ---- Docker containers: dockerdev.slice (sudo) ------------------------------
+# ---- Docker containers: dockerdev.slice -------------------------------------
+# Rootless Docker: a user-level slice, set by `dev limits apply` (no sudo).
+# Rootful Docker: a system slice, installed by system/apply-root.sh (sudo).
 DOCKER_MEMORY_HIGH=35%
 DOCKER_MEMORY_MAX=45%
 DOCKER_SWAP_MAX=2G

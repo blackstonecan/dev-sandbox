@@ -154,7 +154,7 @@ step "Docker build limits"
 if ((!docker)); then
   skip "skipped (--no-docker)"
 elif ! have docker || ! docker info >/dev/null 2>&1; then
-  skip "Docker is not installed or not usable without sudo; run system/docker/setup-builder.sh later"
+  skip "Docker is not installed or not usable without sudo; set up rootless Docker (README), then run dev limits apply"
 else
   bash "$sb/system/docker/setup-builder.sh" >/dev/null
   ok "capped buildx builder created (open a new shell so BUILDX_BUILDER=capped is set)"
@@ -177,7 +177,10 @@ fi
 
 printf '\n%sDone.%s Open a new terminal, then run: dev doctor\n\n' "$B" "$N"
 printf 'Root-level limits are optional; run these yourself:\n'
-if have docker; then
+if have docker && [[ $(docker info --format '{{json .SecurityOptions}}' 2>/dev/null) != *name=rootless* ]] &&
+   docker info >/dev/null 2>&1; then
+  printf '  Docker runs as root; the docker group is root without a password. Prefer\n'
+  printf '  rootless Docker (README, "Rootless Docker"); to keep rootful Docker instead:\n'
   printf '  sudo bash %s/system/docker/apply.sh     # Docker slice + user slice (restarts Docker once)\n' "$sb"
 else
   printf '  sudo bash %s/system/apply-root.sh       # user-session memory backstop\n' "$sb"

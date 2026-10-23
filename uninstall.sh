@@ -43,10 +43,36 @@ if command -v docker >/dev/null 2>&1 && docker buildx inspect capped >/dev/null 
 fi
 rm -f "$sb/state/builder.applied"
 
+# Rootless Docker: the user-level slice and our keys in ~/.config/docker/daemon.json.
+rm -f "$HOME/.config/systemd/user/dockerdev.slice"
+systemctl --user daemon-reload
+dconf=${XDG_CONFIG_HOME:-$HOME/.config}/docker/daemon.json
+if [[ -f $dconf ]] && command -v python3 >/dev/null 2>&1; then
+  changed=$(python3 -c '
+import json, os, sys
+target, ours = sys.argv[1], sys.argv[2]
+cfg = json.load(open(target))
+left = {k: v for k, v in cfg.items() if k not in json.load(open(ours))}
+if left != cfg:
+    if left:
+        with open(target + ".new", "w") as f:
+            json.dump(left, f, indent=2)
+            f.write("\n")
+        os.replace(target + ".new", target)
+    else:
+        os.remove(target)
+    print("changed")
+' "$dconf" "$sb/system/docker/daemon.json")
+  if [[ $changed == changed ]]; then
+    systemctl --user try-restart docker >/dev/null 2>&1 || true
+    echo "removed the dev sandbox settings from $dconf"
+  fi
+fi
+
 cat <<EOF
 
 Left for you to do, if you want:
-  sudo bash $sb/system/docker/revert.sh                       # Docker settings and slice
+  sudo bash $sb/system/docker/revert.sh                       # rootful Docker settings and slice
   sudo systemctl set-property user-$(id -u).slice MemoryHigh=infinity MemoryMax=infinity
   cd ~ && sudo bash $sb/system/image/revert.sh                # only if you ran migrate.sh
   npm config delete cache; go env -u GOMODCACHE GOCACHE

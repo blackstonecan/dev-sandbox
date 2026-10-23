@@ -41,4 +41,6 @@ mkdir -p "$sb/state"
 # env.sh sets BUILDX_BUILDER=capped once this exists; plain `docker build`
 # ignores `buildx use`.
 printf '%s\n' "$BUILD_MEMORY $BUILD_MEMORY_SWAP $BUILD_CPU_CORES $BUILD_CACHE_GB" > "$sb/state/builder.applied"
-docker buildx ls
+# With rootless Docker the "default" context still points at the rootful
+# socket, and listing its builder fails; that error is noise here.
+docker buildx ls 2>/dev/null

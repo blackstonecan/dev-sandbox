@@ -2,6 +2,7 @@
 # Remove what apply.sh set in /etc/docker/daemon.json, remove dockerdev.slice
 # and restart Docker. Run it yourself:
 #   sudo bash <sandbox>/system/docker/revert.sh
+# Rootful Docker only; uninstall.sh undoes the rootless settings.
 set -euo pipefail
 
 src=$(dirname "$(readlink -f "$0")")
