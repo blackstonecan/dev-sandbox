@@ -49,6 +49,7 @@ Left for you to do, if you want:
   sudo bash $sb/system/docker/revert.sh                       # Docker settings and slice
   sudo systemctl set-property user-$(id -u).slice MemoryHigh=infinity MemoryMax=infinity
   cd ~ && sudo bash $sb/system/image/revert.sh                # only if you ran migrate.sh
-  npm config delete cache; pnpm config delete store-dir --global; go env -u GOMODCACHE GOCACHE
-  (and remove cache-dir from ~/.config/uv/uv.toml)
+  npm config delete cache; go env -u GOMODCACHE GOCACHE
+  (and remove cache-dir from ~/.config/uv/uv.toml, storeDir from
+  ~/.config/pnpm/config.yaml and store-dir from ~/.config/pnpm/rc)
 EOF

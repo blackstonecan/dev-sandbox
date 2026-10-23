@@ -97,12 +97,22 @@ The `dev` CLI manages all of this. Run `dev --help` for full usage.
 
 ### Caches
 - Never move cache locations away from `$DEV_SANDBOX/cache` (npm `cache`, pnpm
-  `store-dir`, uv `cache-dir`, `go env GOMODCACHE/GOCACHE`, `GRADLE_USER_HOME`).
+  `storeDir`, uv `cache-dir`, `go env GOMODCACHE/GOCACHE`, `GRADLE_USER_HOME`).
+- pnpm 11 reads `storeDir` only from `~/.config/pnpm/config.yaml`; pnpm 10
+  (projects pinning it in `packageManager`) reads `store-dir` from
+  `~/.config/pnpm/rc`. Both point at `$DEV_SANDBOX/cache/pnpm-store`.
 
 ## Troubleshooting
 - "Cannot find module" / missing `.venv` in a project outside the sandbox: the
   project is inactive; suggest `dev activate`.
 - Caches written to `~/.npm`, `~/.gradle`, `~/.cache/uv`, etc.: run
   `dev doctor`, which reports misconfiguration and legacy caches.
+- A `$DEV_SANDBOX/.pnpm-store` directory means pnpm ran without a store
+  setting and fell back to the filesystem root. Check `pnpm config get
+  store-dir`, reinstall affected projects with `pnpm install
+  --config.confirm-modules-purge=false` (with
+  `pnpm_config_optimistic_repeat_install=false` if it says "Already up to
+  date"), then delete the stray store once no `node_modules/.modules.yaml`
+  references it. Ask the user before deleting.
 - `dev deactivate` refuses because processes are running inside the project:
   stop dev servers/terminals there, or use `--force` only if the user agrees.

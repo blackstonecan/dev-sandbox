@@ -31,6 +31,16 @@ skip() { printf '  %s-%s %s\n' "$Y" "$N" "$*"; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 dev()  { DEV_SANDBOX=$sb "$sb/bin/dev" "$@"; }
+# set_line FILE KEY LINE: replace the line that sets KEY (KEY= or KEY:), or append LINE.
+set_line() {
+  mkdir -p "$(dirname "$1")"
+  touch "$1"
+  if grep -qE "^$2 *[=:]" "$1"; then
+    sed -i -E "s#^$2 *[=:].*#$3#" "$1"
+  else
+    printf '%s\n' "$3" >> "$1"
+  fi
+}
 
 step "Checking requirements"
 [[ $(uname -s) == Linux ]] || die "Linux only (systemd and cgroup v2 do the limiting)"
@@ -95,7 +105,16 @@ done
 step "Package caches"
 if ((caches)); then
   if have npm; then npm config set cache "$sb/cache/npm" && ok "npm cache"; fi
-  if have pnpm; then pnpm config set store-dir "$sb/cache/pnpm-store" --global && ok "pnpm store"; fi
+  if have pnpm; then
+    # pnpm 11 reads storeDir only from config.yaml; pnpm 10 (still used by
+    # projects that pin it in packageManager) reads store-dir from rc.
+    # Written directly: `pnpm config set --global` refuses to run when pnpm's
+    # global bin directory is not on PATH.
+    pconf=${XDG_CONFIG_HOME:-$HOME/.config}/pnpm
+    set_line "$pconf/config.yaml" storeDir "storeDir: $sb/cache/pnpm-store"
+    set_line "$pconf/rc" store-dir "store-dir=$sb/cache/pnpm-store"
+    ok "pnpm store"
+  fi
   if have go; then go env -w GOMODCACHE="$sb/cache/go-mod" GOCACHE="$sb/cache/go-build" && ok "Go caches"; fi
   if have uv; then
     uvconf=$HOME/.config/uv/uv.toml

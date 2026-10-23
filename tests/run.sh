@@ -108,6 +108,19 @@ out=$(dev activate "$T/home/projects/keys" --no-install 2>&1)
 check "activate is quiet when secret is not installed" bash -c "! grep -q 'secretd' <<< '$out'"
 dev deactivate keys >/dev/null 2>&1
 
+echo "doctor"
+mkdir -p "$T/sb/.pnpm-store/v11"
+check "doctor reports a stray pnpm store" bash -c "$(declare -f dev); T='$T' repo='$repo'; dev doctor 2>&1 | grep -q 'stray pnpm store'"
+rmdir "$T/sb/.pnpm-store/v11" "$T/sb/.pnpm-store"
+
+echo "install.sh set_line"
+eval "$(sed -n '/^set_line()/,/^}/p' "$repo/install.sh")"
+printf 'only-built-dependencies=x\nstore-dir=/old\n' > "$T/rc"
+set_line "$T/rc" store-dir "store-dir=/new"
+check "set_line replaces an existing key" bash -c "grep -qx 'store-dir=/new' '$T/rc' && grep -qx 'only-built-dependencies=x' '$T/rc' && ! grep -q /old '$T/rc'"
+set_line "$T/new/config.yaml" storeDir "storeDir: /new"
+check "set_line creates a missing file" grep -qx 'storeDir: /new' "$T/new/config.yaml"
+
 echo
 echo "$pass passed, $fail failed"
 ((fail == 0))

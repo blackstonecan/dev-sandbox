@@ -884,7 +884,12 @@ cmd_doctor() {
     note "npm cache is not in the sandbox: npm config set cache $CACHE/npm"
   fi
   if have pnpm && [[ $(pnpm config get store-dir 2>/dev/null) != "$CACHE/pnpm-store" ]]; then
-    note "pnpm store is not in the sandbox: pnpm config set store-dir $CACHE/pnpm-store --global"
+    note "pnpm store is not in the sandbox: set 'storeDir: $CACHE/pnpm-store' in ~/.config/pnpm/config.yaml (pnpm 11) or rerun install.sh"
+  fi
+  # pnpm puts its store at the root of the filesystem when it has no storeDir
+  # and the default store is on another filesystem (the sandbox image).
+  if [[ -d $SANDBOX/.pnpm-store ]]; then
+    note "stray pnpm store $SANDBOX/.pnpm-store ($(du -sh "$SANDBOX/.pnpm-store" 2>/dev/null | cut -f1)): reinstall the projects that use it, then delete it"
   fi
   if have uv && [[ $(uv cache dir 2>/dev/null) != "$CACHE/uv" ]]; then
     note "uv cache is not in the sandbox: set cache-dir in ~/.config/uv/uv.toml"

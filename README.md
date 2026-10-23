@@ -53,7 +53,9 @@ The installer never uses `sudo`. It:
 - creates `limits.conf` sized for your CPU count and RAM, and detects the
   systemd slice your terminal runs in (run it from the terminal you develop in)
 - links `dev` into `~/.local/bin` and sources `env.sh` from `~/.bashrc`/`~/.zshrc`
-- points npm, pnpm, uv and Go caches into `~/dev-sandbox/cache`
+- points npm, pnpm, uv and Go caches into `~/dev-sandbox/cache` (pnpm: `storeDir`
+  in `~/.config/pnpm/config.yaml` for pnpm 11, `store-dir` in
+  `~/.config/pnpm/rc` for pnpm 10)
 - enables the disk watchdog timer
 - creates the capped Docker builder and applies the terminal limits
 - links the Claude Code skill into `~/.claude/skills` if `~/.claude` exists
