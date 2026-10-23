@@ -82,6 +82,32 @@ check "activate refuses a protected directory" bash -c "$(declare -f dev); T='$T
 dev clean "$T/home/projects" --yes >/dev/null
 check "clean skips a protected directory" test -d "$T/home/projects/kept/node_modules"
 
+echo "secretd"
+mkdir -p "$T/bin"
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/secret"
+chmod +x "$T/bin/secret"
+dev_secret() {
+  env -i HOME="$T/home" PATH="$T/bin:/usr/bin:/bin" DEV_SANDBOX="$T/sb" \
+    DEV_PROJECT_ROOTS="$T/home/projects" bash "$repo/bin/dev" "$@" </dev/null
+}
+mkproj "$T/home/projects/keys"
+printf 'PORT=3000\nexport API_KEY=sk-value-1\nDb_Password=value-2\nEMPTY_TOKEN=\n' > "$T/home/projects/keys/.env"
+out=$(dev_secret activate "$T/home/projects/keys" --no-install 2>&1)
+check "activate names credential keys in .env" grep -q 'API_KEY, Db_Password)' <<< "$out"
+check "activate never prints secret values" bash -c "! grep -q 'value-' <<< '$out'"
+check "activate skips keys without a value" bash -c "! grep -q 'EMPTY_TOKEN' <<< '$out'"
+dev_secret deactivate keys >/dev/null 2>&1
+check "deactivate keeps .env" test -f "$T/home/projects/keys/.env"
+touch "$T/home/projects/keys/secrets.yaml"
+out=$(dev_secret activate "$T/home/projects/keys" --no-install 2>&1)
+check "activate is quiet when secrets.yaml exists" bash -c "! grep -q 'secretd' <<< '$out'"
+dev_secret deactivate keys >/dev/null 2>&1
+check "deactivate keeps secrets.yaml" test -f "$T/home/projects/keys/secrets.yaml"
+rm "$T/home/projects/keys/secrets.yaml"
+out=$(dev activate "$T/home/projects/keys" --no-install 2>&1)
+check "activate is quiet when secret is not installed" bash -c "! grep -q 'secretd' <<< '$out'"
+dev deactivate keys >/dev/null 2>&1
+
 echo
 echo "$pass passed, $fail failed"
 ((fail == 0))

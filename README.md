@@ -110,7 +110,10 @@ file ever runs as root. It only ever grows the disk image.
 - Only well-known artifact directories are deleted, and `build`, `dist`,
   `target`, `coverage`, `.gradle` only next to a matching build file
   (`package.json`, `Cargo.toml`, `build.gradle`, ...).
-- Anything tracked by git, `.git` itself and `.env` files are never touched.
+- Anything tracked by git, `.git` itself, `.env` and `secrets.yaml` files are
+  never touched. When secretd's `secret` CLI is installed, `activate` lists credential-like keys in a plain
+  `.env` (names only) and suggests `secret import`; `doctor` checks that secretd
+  is reachable.
 - A directory containing a `.devkeep` file is never moved or cleaned.
 - `activate`/`deactivate` refuse when a process (dev server, editor, shell) is
   running inside the project, when the name or original path is taken, or when

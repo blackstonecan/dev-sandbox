@@ -109,7 +109,7 @@ ${B}What gets deleted:${N}
   (.venv/venv with pyvenv.cfg), and build dist target coverage .gradle .cxx
   .dart_tool Pods only next to a matching build file (package.json,
   build.gradle, Cargo.toml, ...). Directories tracked by git are never deleted.
-  Source code, .git and .env files are never touched.
+  Source code, .git, .env and secrets.yaml files are never touched.
 
 ${B}Protecting a directory:${N}
   touch <dir>/$KEEP_MARKER    dev will never move or clean it.
@@ -579,6 +579,18 @@ install_go() {
 
 # -------------------------------------------------------------- commands ----
 
+# When secretd is installed, point at it for credentials kept in a plain .env.
+# Prints key names only, never values.
+check_secrets() {
+  local dir=$1 name=$2 keys
+  have secret && [[ -f $dir/.env && ! -f $dir/secrets.yaml ]] || return 0
+  keys=$(sed -nE 's/^(export +)?([A-Za-z_][A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS)[A-Za-z0-9_]*)=.+/\2/Ip' \
+    "$dir/.env" | paste -sd, - | sed 's/,/, /g')
+  [[ -n $keys ]] || return 0
+  warn ".env holds credentials ($keys); move them into secretd:"
+  printf '  cd %s && secret init --project %s && secret import .env\n' "${dir/#"$HOME"/\~}" "$name" >&2
+}
+
 cmd_activate() {
   local path="" name="" install=1 force=0 src dest
   while (($#)); do
@@ -626,6 +638,7 @@ cmd_activate() {
     install_go "$dest"
   fi
   warn_over_limits "$name"
+  check_secrets "$dest" "$name"
   printf '%sready:%s cd %s\n' "$B" "$N" "${dest/#"$HOME"/\~}"
 }
 
@@ -885,6 +898,9 @@ cmd_doctor() {
   [[ ${PIP_REQUIRE_VIRTUALENV:-} == true ]] || note "PIP_REQUIRE_VIRTUALENV is not set (global pip installs are allowed)"
   if have conda || [[ -d $HOME/miniconda3 || -d $HOME/anaconda3 ]]; then
     note "conda is installed; use uv (or pixi for conda packages) instead"
+  fi
+  if have secret && ! secret status >/dev/null 2>&1; then
+    note "secretd is installed but not reachable (secret status)"
   fi
   ((issues)) || printf '  %sok%s\n' "$G" "$N"
 

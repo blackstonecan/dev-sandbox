@@ -28,6 +28,8 @@ The `dev` CLI manages all of this. Run `dev --help` for full usage.
     Needed when two projects share a folder name.
   - `--no-install`: only move, install nothing.
   - `--force`: proceed even if processes are running inside the project.
+  - If it warns that `.env` holds credentials, follow the secretd skill to
+    move them (`secret import .env`); never print or copy the values.
 - `dev deactivate <name>`: stops Gradle daemons, deletes artifacts, moves the
   project back to its original path and prunes caches.
 - `dev path <name>`: prints the sandbox path (`cd "$(dev path NAME)"`).
