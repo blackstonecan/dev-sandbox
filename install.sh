@@ -53,7 +53,7 @@ ok "Linux, bash $BASH_VERSION, cgroup v2, systemd user manager"
 step "Sandbox at $sb"
 mkdir -p "$sb/projects" "$sb/cache" "$sb/state"
 touch "$sb/state/projects.tsv"
-chmod +x "$sb/bin/dev" "$sb"/system/*.sh "$sb"/system/*/*.sh "$sb"/*.sh
+chmod +x "$sb/bin/dev" "$sb"/system/*.sh "$sb"/system/*/*.sh "$sb/install.sh" "$sb/uninstall.sh"
 if [[ -f $sb/limits.conf ]]; then
   ok "limits.conf exists; kept as it is"
 else
