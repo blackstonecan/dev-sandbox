@@ -603,12 +603,10 @@ install_node() {
       continue
     fi
     if [[ ! -f $dir/pnpm-lock.yaml ]] && has_any "$dir" package-lock.json yarn.lock; then
-      info "migrating ${dir#"$root"/} to pnpm"
-      if (cd "$dir" && pnpm import >/dev/null); then
-        rm -f "$dir/package-lock.json" "$dir/yarn.lock"
-      else
+      # Keep the npm/yarn lockfile: the project may still build or deploy with it.
+      info "importing ${dir#"$root"/} lockfile into pnpm"
+      (cd "$dir" && pnpm import >/dev/null) ||
         warn "pnpm import failed in $dir; installing from package.json"
-      fi
     fi
     # React Native / Expo need a flat node_modules; hoisted still uses the
     # shared pnpm store, so files are hard-linked rather than copied.
