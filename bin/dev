@@ -48,7 +48,7 @@ human() { numfmt --to=iec --suffix=B "${1:-0}"; }
 # never on the sandbox filesystem, which may be a size-capped image).
 avail_bytes() { df --output=avail -B1 "$SANDBOX" | tail -1 | tr -d ' '; }
 host_avail_bytes() { df --output=avail -B1 "$HOME" | tail -1 | tr -d ' '; }
-size_of() { du -sb "$@" 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
+size_of() { { du -sb "$@" 2>/dev/null || true; } | awk '{s+=$1} END {print s+0}'; }
 gb() { printf '%s\n' $(( $1 * 1024 * 1024 * 1024 )); }
 
 confirm() {
