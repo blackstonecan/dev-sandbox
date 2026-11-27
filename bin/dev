@@ -759,6 +759,7 @@ prune_caches() {
   if have pnpm; then
     info "pnpm store prune"
     pnpm store prune >/dev/null 2>&1 || warn "pnpm store prune failed"
+    prune_other_pnpm_stores
   fi
   if ! grep -qx node <<< "$kinds" && have npm; then
     info "npm cache clean (no active Node projects)"
@@ -768,6 +769,7 @@ prune_caches() {
     if grep -qx python <<< "$kinds"; then
       info "uv cache prune"
       timeout 120 uv cache prune -q 2>/dev/null || warn "uv cache prune failed (cache in use?)"
+      prune_unlinked_uv_archives
     else
       info "uv cache clean (no active Python projects)"
       timeout 120 uv cache clean -q 2>/dev/null || warn "uv cache clean failed (cache in use?)"
@@ -791,6 +793,43 @@ prune_caches() {
       done
     fi
   fi
+}
+
+# pnpm prunes only the store of its own major version (pnpm-store/vN). Stores
+# of other majors, used by projects that pin one in packageManager, are pruned
+# with that pnpm by running it in such a project, or removed when nothing uses them.
+prune_other_pnpm_stores() {
+  local store dir major pin
+  store=$(pnpm store path 2>/dev/null) || return 0
+  for dir in "$(dirname "$store")"/v*; do
+    [[ -d $dir && $dir != "$store" ]] || continue
+    major=${dir##*/v}
+    pin=$(grep -rlE --include=package.json --exclude-dir=node_modules --exclude-dir=.git \
+      "\"packageManager\": *\"pnpm@$major\." "$PROJECTS" 2>/dev/null | head -1)
+    if [[ -n $pin ]]; then
+      info "pnpm store prune (v$major store)"
+      (cd "$(dirname "$pin")" && [[ $(pnpm store path 2>/dev/null) == "$dir" ]] &&
+        pnpm store prune >/dev/null 2>&1) || warn "pnpm v$major store prune failed"
+    elif [[ -z $(find "$dir" -type f -links +1 -print -quit) ]]; then
+      info "removing unused pnpm v$major store"
+      remove_dir "$dir"
+    fi
+  done
+}
+
+# uv cache prune keeps every unpacked wheel it ever downloaded. Venvs hardlink
+# their files from archive-v0, so an entry with no hardlinked file is used by
+# no venv in the sandbox; uv downloads it again if it is needed. Entries from
+# the last hour are kept in case an install is still running.
+prune_unlinked_uv_archives() {
+  local dir=${UV_CACHE_DIR:-$CACHE/uv}/archive-v0 entry n=0
+  [[ -d $dir ]] || return 0
+  while IFS= read -r -d '' entry; do
+    [[ -n $(find "$entry" -type f -links +1 -print -quit) ]] && continue
+    remove_dir "$entry"
+    n=$((n + 1))
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -mmin +60 -print0)
+  ((n == 0)) || info "removed $n unpacked wheels no venv uses"
 }
 
 cmd_prune() {
@@ -908,6 +947,32 @@ cmd_status() {
   fi
 }
 
+# Prunes caches once when the sandbox filesystem's free space ($1 bytes) drops
+# below FS_WARN_FREE_GB; re-armed when it is back above. Skipped while a package
+# install is running (pnpm store prune could delete packages it has not linked
+# yet) and retried on the next check. Returns 0 if it pruned.
+auto_prune() {
+  local marker="$SANDBOX/state/auto-prune" dir
+  if (($1 >= $(gb "$FS_WARN_FREE_GB"))); then rm -f "$marker"; return 1; fi
+  [[ -f $marker ]] && return 1
+  if pgrep -u "$(id -u)" -f -- \
+    '(^|/)(pnpm(\.c?js)?|npm|yarn)(( .*)? (install|i|ci|add|update|up|upgrade|remove|rm|uninstall|un|import|dlx|fetch|rebuild)( |$)|$)|(^|/)uv (sync|add|remove|lock|pip|venv|tool)( |$)' \
+    >/dev/null; then
+    info "package install running; pruning on the next check"
+    return 1
+  fi
+  # The timer's PATH lacks nvm, where pnpm is usually installed.
+  if ! have pnpm; then
+    dir=$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V |
+      while read -r d; do [[ -x $d/pnpm ]] && echo "$d"; done | tail -1) || true
+    [[ -n $dir ]] && PATH="$dir:$PATH"
+  fi
+  have pnpm || warn "pnpm not found; the pnpm store is not pruned"
+  info "sandbox filesystem is low on space; pruning caches"
+  prune_caches
+  touch "$marker"
+}
+
 # Notifies when free disk space crosses a threshold; run by dev-watchdog.timer.
 cmd_watchdog() {
   local free sbfree level=ok last="" file="$SANDBOX/state/watchdog" msg what urgency=normal
@@ -920,6 +985,7 @@ cmd_watchdog() {
   # A capped sandbox filesystem can fill up while the host disk is fine.
   if mountpoint -q "$SANDBOX"; then
     sbfree=$(avail_bytes)
+    auto_prune "$sbfree" && sbfree=$(avail_bytes)
     if ((sbfree < $(gb "$FS_CRITICAL_FREE_GB"))); then
       level=critical what="$(human "$sbfree") of the sandbox filesystem"
     elif ((sbfree < $(gb "$FS_WARN_FREE_GB"))) && [[ $level == ok ]]; then
